@@ -1,4 +1,4 @@
-"""MCP server exposing an ESPN fantasy football league for draft assistance.
+"""MCP server exposing an ESPN fantasy football league: draft and in-season.
 
 Design rule: tools return facts, not opinions. The one exception is the value
 math (VORP, tiers, replacement level), which is deterministic arithmetic that a
@@ -18,17 +18,34 @@ from .board import DraftBoard
 from .config import Config, load_config
 from .espn import ESPNError
 from .scoring import LeagueShape
+from .season import (
+    ROS_KEY,
+    WEEK_KEY,
+    current_starters,
+    drop_candidates,
+    evaluate_trade,
+    league_position_averages,
+    lineup_changes,
+    optimal_lineup,
+    roster_profile,
+    waiver_gain,
+)
 
 mcp = MCPServer(
     "espn-fantasy-draft",
     version=__version__,
     instructions=(
-        "Tools for drafting in an ESPN fantasy football snake draft. Call "
-        "get_league_settings once to learn the format, then get_draft_context "
-        "whenever a pick decision is needed -- it bundles state, roster needs "
-        "and best-available in one call. Rankings are by VORP (value over "
-        "replacement), which already accounts for positional scarcity in this "
-        "league's specific lineup; do not re-rank by raw projected points."
+        "Tools for an ESPN fantasy football league, for the draft and the season. "
+        "Call get_league_settings once to learn the format. DRAFT: get_draft_context "
+        "whenever a pick decision is needed -- it bundles state, roster needs and "
+        "best-available in one call. IN SEASON: get_matchup for this week's game "
+        "and start/sit, get_waiver_targets for who to add and drop, analyze_trade "
+        "to evaluate a specific offer, find_trade_partners to see which teams have "
+        "what you need. Rankings are by VORP (value over replacement), which already "
+        "accounts for positional scarcity in this league's specific lineup; do not "
+        "re-rank by raw projected points. In season, VORP is over rest-of-season "
+        "points; week_proj is ESPN's single-week projection and already reflects "
+        "the NFL opponent, injury status and bye."
     ),
 )
 
@@ -320,6 +337,9 @@ def get_roster(team_id: int | None = None) -> dict:
     if not tid:
         return {"error": "No team_id given and ESPN_TEAM_ID is not set."}
 
+    if b.shape().is_active:
+        return _season_roster(b, int(tid))
+
     teams = b.teams(refresh=True)
     team = teams.get(int(tid))
     if not team:
@@ -342,6 +362,36 @@ def get_roster(team_id: int | None = None) -> dict:
         "team_name": team["name"],
         "players": [_slim(p) for p in players],
         **needs,
+    }
+
+
+def _season_roster(b: DraftBoard, tid: int) -> dict:
+    """In-season roster view: lineup slots, this week, rest of season, strength."""
+    shape = b.shape()
+    week = b.week()
+    teams = b.league_rosters(week)
+    team = teams.get(tid)
+    if not team:
+        return {"error": f"Team {tid} not found. Known: {sorted(teams)}"}
+    players = b.team_players(tid, week)
+    prof = roster_profile(players, shape)
+    starters = current_starters(players)
+    return {
+        **_team_brief(team),
+        "week": week,
+        "waiver_priority": team.get("waiver_rank"),
+        "starters": [_slim_season(p) for p in starters],
+        "bench": [_slim_season(p) for p in players if p not in starters],
+        "starters_this_week": prof["starters_this_week"],
+        "starters_ros_per_game": prof["starters_ros_per_game"],
+        "starter_avg_ros_per_game_by_position": {
+            pos: blk["starter_avg"] for pos, blk in prof["positions"].items()
+            if blk["starter_avg"] is not None
+        },
+        "position_counts": {pos: len(blk["starters"]) + len(blk["bench"])
+                            for pos, blk in prof["positions"].items()},
+        "position_limits": shape.position_limits,
+        "trade_block": [p["name"] for p in players if p.get("on_trade_block")],
     }
 
 
@@ -707,6 +757,511 @@ def refresh_board() -> dict:
         "players_loaded": len(data["players"]),
         "replacement_points": data["replacement_points"],
     }
+
+
+# --------------------------------------------------------------------------
+# In-season tools
+# --------------------------------------------------------------------------
+
+
+def _local_time(ms: int | None, fmt: str = "%a %I:%M %p") -> str | None:
+    if not ms:
+        return None
+    from datetime import datetime, timezone
+    return (datetime.fromtimestamp(ms / 1000, timezone.utc).astimezone()
+            .strftime(fmt).replace(" 0", " "))
+
+
+def _slim_season(p: dict) -> dict:
+    """Compact in-season record: this week and the rest of the season."""
+    out = {
+        "id": p["player_id"],
+        "name": p["name"],
+        "pos": p["position"],
+        "team": p["pro_team"],
+        "opp": p.get("nfl_opponent"),
+        "week_proj": p.get(WEEK_KEY),
+        "ros_pg": p.get(ROS_KEY),
+        "ros": p.get("ros_points"),
+        "vorp": p.get("vorp"),
+        "injury": p.get("injury_status"),
+    }
+    if p.get("slot"):
+        out["slot"] = p["slot"]
+    if p.get("on_bye"):
+        out["bye"] = True
+    elif p.get("bye_week"):
+        out["bye_week"] = p["bye_week"]
+    if p.get("opp_rank_vs_pos"):
+        out["opp_rank_vs_pos"] = p["opp_rank_vs_pos"]
+    if p.get("kickoff_ms"):
+        out["kickoff"] = _local_time(p["kickoff_ms"])
+    if p.get("on_trade_block"):
+        out["on_trade_block"] = True
+    if p.get("value_basis") != "vorp":
+        out["ranked_by"] = "week_proj"  # no ROS projection (D/ST)
+    return out
+
+
+def _record(t: dict) -> str:
+    rec = f"{t['wins']}-{t['losses']}"
+    if t.get("ties"):
+        rec += f"-{t['ties']}"
+    return rec
+
+
+def _team_brief(t: dict) -> dict:
+    return {"team_id": t["team_id"], "name": t["name"], "record": _record(t),
+            "points_for": t["points_for"]}
+
+
+def _resolve(names: list[str], players: list[dict], label: str) -> tuple[list[dict], list[dict]]:
+    """Match names against a roster. Returns (matched, problems)."""
+    found, problems = [], []
+    for name in names:
+        q = name.lower().strip()
+        hits = [p for p in players if q in (p["name"] or "").lower()]
+        exact = [p for p in hits if p["name"].lower() == q]
+        if exact:
+            hits = exact
+        if not hits:
+            problems.append({"name": name, "problem": f"not on {label}"})
+        elif len(hits) > 1:
+            problems.append({"name": name, "problem": "ambiguous",
+                             "candidates": [p["name"] for p in hits[:5]]})
+        else:
+            found.append(hits[0])
+    return found, problems
+
+
+def _require_team(b: DraftBoard) -> int | None:
+    return b.cfg.team_id
+
+
+def _week_note(shape: LeagueShape) -> str | None:
+    if not shape.is_active:
+        return "ESPN reports the season as not active yet; projections are preseason."
+    return None
+
+
+@mcp.tool()
+@handle_errors
+def get_matchup(week: int | None = None) -> dict:
+    """This week's head-to-head: both lineups, start/sit, and where the game is won.
+
+    Compares your set lineup to the optimal one by ESPN's weekly projection
+    (which already reflects the NFL opponent, injury designation and bye),
+    lists the exact start/sit swaps and what they are worth, and shows the
+    opponent's projected lineup with any holes (bye, OUT, empty slot).
+
+    Args:
+        week: defaults to the current week. Pass next week to plan ahead.
+    """
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = week or b.week()
+
+    game = next((m for m in b.matchups(week)
+                 if me in (m["home_team_id"], m["away_team_id"])), None)
+    teams = b.league_rosters(week)
+    if not game:
+        return {"week": week, "error": f"No matchup found for team {me} in week {week}.",
+                "note": "Bye week, or the week is outside the schedule."}
+    i_am_home = game["home_team_id"] == me
+    opp_id = game["away_team_id"] if i_am_home else game["home_team_id"]
+
+    my = b.team_players(me, week)
+    theirs = b.team_players(opp_id, week)
+    mine = lineup_changes(my, shape, WEEK_KEY)
+    opp = lineup_changes(theirs, shape, WEEK_KEY)
+
+    def holes(starters: list[dict]) -> list[dict]:
+        out = []
+        for p in starters:
+            why = None
+            if p.get("on_bye"):
+                why = "bye"
+            elif p.get("injury_status") in ("OUT", "INJURY_RESERVE", "SUSPENSION", "DOUBTFUL"):
+                why = p["injury_status"].lower()
+            elif not p.get(WEEK_KEY):
+                why = "no projection"
+            if why:
+                out.append({"name": p["name"], "pos": p["position"], "slot": p.get("slot"), "why": why})
+        return out
+
+    def flags(starters: list[dict]) -> list[str]:
+        return [f"{p['name']} is {p['injury_status']}" for p in starters
+                if p.get("injury_status") in ("QUESTIONABLE",)]
+
+    my_now = current_starters(my)
+    opp_now = current_starters(theirs)
+    empty = [slot for slot, p in mine["optimal"]["starters"] if p is None]
+
+    my_win_prob = game["home_win_prob"] if i_am_home else (
+        round(1 - game["home_win_prob"], 3) if game["home_win_prob"] is not None else None)
+
+    out: dict[str, Any] = {
+        "week": week,
+        "me": {**_team_brief(teams[me]), "home": i_am_home},
+        "opponent": _team_brief(teams[opp_id]),
+        "espn": {
+            "my_projection": game["home_espn_proj"] if i_am_home else game["away_espn_proj"],
+            "their_projection": game["away_espn_proj"] if i_am_home else game["home_espn_proj"],
+            "my_win_probability": my_win_prob,
+            "my_points": game["home_points"] if i_am_home else game["away_points"],
+            "their_points": game["away_points"] if i_am_home else game["home_points"],
+            "status": game["winner"],
+        },
+        "my_lineup": {
+            "set_total": mine["current_total"],
+            "optimal_total": mine["optimal_total"],
+            "gain_from_optimal": mine["gain"],
+            "start": [_slim_season(p) for p in mine["start"]],
+            "sit": [_slim_season(p) for p in mine["sit"]],
+            "starters_now": [_slim_season(p) for p in my_now],
+            "bench": [_slim_season(p) for p in my if p not in my_now],
+            "holes": holes(my_now),
+            "questionable": flags(my_now),
+            "unfillable_slots": empty,
+        },
+        "opponent_lineup": {
+            "set_total": opp["current_total"],
+            "optimal_total": opp["optimal_total"],
+            "starters_now": [_slim_season(p) for p in opp_now],
+            "best_bench": [_slim_season(p) for p in
+                           sorted((p for p in theirs if p not in opp_now),
+                                  key=lambda p: -(p.get(WEEK_KEY) or 0))[:4]],
+            "holes": holes(opp_now),
+            "questionable": flags(opp_now),
+        },
+        "margin_if_both_optimal": round(mine["optimal_total"] - opp["optimal_total"], 1),
+        "note": (
+            "week_proj is ESPN's projection for this week and already reflects the "
+            "NFL opponent, injury status and bye. opp_rank_vs_pos is ESPN's OPRK: "
+            "1 = defense that allows the most to that position (best matchup), 32 = "
+            "stingiest; absent until games have been played."
+        ),
+    }
+    if (n := _week_note(shape)):
+        out["season_note"] = n
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def get_waiver_targets(position: str | None = None, limit: int = 12,
+                       week: int | None = None) -> dict:
+    """Who to add, who to drop, and what each swap is worth.
+
+    Every unrostered player is scored by what adding him does to your optimal
+    lineup: rest-of-season points per game (the lasting value of the roster
+    spot) and this week's projection (a streamer). Ranked by the former;
+    `streamers_this_week` re-ranks by the latter. Drop candidates are players
+    neither horizon starts, least valuable first.
+
+    Args:
+        position: QB, RB, WR, TE, K or D/ST. Omit for all.
+        limit: how many targets to return.
+        week: defaults to the current week.
+    """
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = week or b.week()
+    pos = position.upper() if position else None
+
+    my = b.team_players(me, week)
+    teams = b.league_rosters(week)
+    avail = b.season_available(week, pos)
+
+    scored = []
+    for c in avail:
+        g = waiver_gain(my, c, shape)
+        entry = _slim_season(c)
+        entry.update(g)
+        entry["status"] = c.get("roster_status")
+        if c.get("waiver_clears_ms"):
+            entry["waivers_clear"] = _local_time(c["waiver_clears_ms"], "%a %b %d %I:%M %p")
+        entry["rostered_pct"] = c.get("percent_owned")
+        if c.get("percent_owned_change"):
+            entry["rostered_change_7d"] = c["percent_owned_change"]
+        scored.append(entry)
+
+    late = {"K", "D/ST"}
+    # Ties on lineup gain (usually: nobody cracks a set lineup) fall through to
+    # depth value, where a kicker's VORP must not outrank a running back's --
+    # the same guard the draft board applies.
+    by_ros = sorted(scored, key=lambda e: (-(e["lineup_gain_ros_per_game"] or 0),
+                                           e["pos"] in late,
+                                           -(e["vorp"] or 0), -(e["ros_pg"] or 0)))
+    by_week = sorted(scored, key=lambda e: (-(e["lineup_gain_this_week"] or 0),
+                                            -(e["week_proj"] or 0)))
+    # Depth adds that never crack the lineup still matter: best by ROS VORP.
+    depth = sorted((e for e in scored if e["vorp"] is not None
+                    and (pos or e["pos"] not in late)),
+                   key=lambda e: -e["vorp"])
+
+    mine_t = teams[me]
+    out: dict[str, Any] = {
+        "week": week,
+        "my_waiver_priority": mine_t.get("waiver_rank"),
+        "waiver_rules": shape.waivers,
+        "targets": by_ros[:limit],
+        "streamers_this_week": [e for e in by_week[:limit] if (e["lineup_gain_this_week"] or 0) > 0],
+        "best_depth_by_ros_vorp": depth[:min(limit, 8)],
+        "drop_candidates": [_slim_season(p) for p in drop_candidates(my, shape, 5, pos)],
+        "note": (
+            "lineup_gain_* is the change in your optimal lineup total if the player "
+            "is added (before any drop). 0 means he sits behind what you have. "
+            "status WAIVERS means a claim, processed at waivers_clear; FREEAGENT "
+            "is an immediate add. rostered_change_7d is the league-wide add trend."
+        ),
+    }
+    if shape.waivers.get("uses_faab"):
+        spent = mine_t.get("faab_spent") or 0
+        out["faab_remaining"] = (shape.waivers.get("faab_budget") or 0) - spent
+    if (n := _week_note(shape)):
+        out["season_note"] = n
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def analyze_trade(give: list[str], receive: list[str],
+                  partner_team_id: int | None = None) -> dict:
+    """Evaluate a trade from both sides: lineup strength before and after.
+
+    For each team: optimal-lineup rest-of-season points per game (the lasting
+    value), this week's optimal total, bench value, roster legality (size and
+    position limits), and suggested drops if the trade leaves a roster over
+    the limit. A trade that raises both teams' starting lineups is the kind
+    that gets accepted.
+
+    Args:
+        give: names of players you send (must be on your roster).
+        receive: names of players you get.
+        partner_team_id: the other team. Inferred from `receive` if omitted.
+    """
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = b.week()
+    teams = b.league_rosters(week)
+
+    my = b.team_players(me, week)
+    mine, problems = _resolve(give, my, "your roster")
+
+    if partner_team_id is None:
+        # Resolve `receive` against every other roster at once, so a partial
+        # name is matched league-wide (exact name first), then read the owner.
+        everyone = []
+        for tid in teams:
+            if tid != me:
+                for p in b.team_players(tid, week):
+                    everyone.append({**p, "_team": tid})
+        found, more = _resolve(receive, everyone, "any other roster")
+        if more:
+            return {"error": "Could not resolve every player.", "problems": problems + more}
+        owners = {p["_team"] for p in found}
+        if len(owners) != 1:
+            return {"error": "The players in `receive` are on different teams; a trade "
+                             "has one partner. Pass partner_team_id.",
+                    "owners": {p["name"]: teams[p["_team"]]["name"] for p in found}}
+        partner_team_id = owners.pop()
+    if int(partner_team_id) not in teams:
+        return {"error": f"Team {partner_team_id} not found. Known: {sorted(teams)}"}
+    theirs = b.team_players(int(partner_team_id), week)
+    theirs_in, more = _resolve(receive, theirs, teams[int(partner_team_id)]["name"])
+    problems += more
+    if problems:
+        return {"error": "Could not resolve every player.", "problems": problems}
+
+    ev = evaluate_trade(my, theirs, mine, theirs_in, shape)
+
+    def side(res: dict, roster_after: list[dict], protect: str | None) -> dict:
+        out = {
+            "before": res["before"],
+            "after": res["after"],
+            "delta": res["delta"],
+            "must_drop": res["must_drop"],
+            "violations": res["violations"],
+            "lineup_after": [
+                {"slot": slot, **_slim_season(p)} if p else {"slot": slot, "empty": True}
+                for slot, p in optimal_lineup(roster_after, shape, ROS_KEY)["starters"]
+            ],
+        }
+        if res["must_drop"]:
+            out["suggested_drops"] = [_slim_season(p) for p in
+                                      drop_candidates(roster_after, shape, res["must_drop"] + 2, protect)]
+        return out
+
+    deadline = shape.season_describe()
+    out: dict[str, Any] = {
+        "week": week,
+        "partner": _team_brief(teams[int(partner_team_id)]),
+        "give": [_slim_season(p) for p in mine],
+        "receive": [_slim_season(p) for p in theirs_in],
+        "me": side(ev["me"], ev["me"]["roster_after"], None),
+        "them": side(ev["them"], ev["them"]["roster_after"], None),
+        "summary": {
+            "my_starters_ros_per_game_change": ev["me"]["delta"]["starters_ros_per_game"],
+            "their_starters_ros_per_game_change": ev["them"]["delta"]["starters_ros_per_game"],
+            "my_this_week_change": ev["me"]["delta"]["starters_this_week"],
+            "their_this_week_change": ev["them"]["delta"]["starters_this_week"],
+            "ros_vorp_given": round(sum(p.get("vorp") or 0 for p in mine), 1),
+            "ros_vorp_received": round(sum(p.get("vorp") or 0 for p in theirs_in), 1),
+        },
+        "note": (
+            "starters_ros_per_game is each team's optimal lineup total in rest-of-"
+            "season points per game -- the number that decides whether a trade "
+            "helps. bench_ros_vorp is depth value. Position counts after the trade "
+            "are checked against the league's roster limits."
+        ),
+    }
+    if deadline.get("trade_deadline_local"):
+        out["trade_deadline"] = deadline["trade_deadline_local"]
+        out["trade_deadline_passed"] = deadline["trade_deadline_passed"]
+    if shape.trade_veto_votes:
+        out["veto_votes_required"] = shape.trade_veto_votes
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def find_trade_partners(position: str | None = None, per_team: int = 3) -> dict:
+    """Which teams have what you need, and need what you have.
+
+    Profiles every roster by starter strength per position (rest-of-season
+    points per game, versus the league average) and finds mutual fits: their
+    players who would raise your optimal lineup, and your players who would
+    raise theirs. Also surfaces each team's ESPN trade block and record --
+    a team out of contention sells differently from one in first.
+
+    Args:
+        position: focus on one position you want to acquire. Omit for all.
+        per_team: candidates to list on each side per team.
+    """
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = b.week()
+    teams = b.league_rosters(week)
+    pos = position.upper() if position else None
+
+    rosters = {tid: b.team_players(tid, week) for tid in teams}
+    profiles = {tid: roster_profile(r, shape) for tid, r in rosters.items()}
+    avgs = league_position_averages(profiles)
+
+    def team_needs(tid: int) -> dict[str, float]:
+        prof = profiles[tid]
+        out = {}
+        for p, block in prof["positions"].items():
+            if p in ("K", "D/ST") or block["starter_avg"] is None or p not in avgs:
+                continue
+            gap = round(avgs[p] - block["starter_avg"], 2)
+            if gap > 0:
+                out[p] = gap
+        return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+    my_roster = rosters[me]
+    my_needs = team_needs(me)
+    if pos:
+        my_needs = {pos: my_needs.get(pos, 0.0)}
+    skill = lambda p: p["position"] not in ("K", "D/ST")  # noqa: E731
+
+    partners = []
+    for tid, roster in rosters.items():
+        if tid == me:
+            continue
+        their_needs = team_needs(tid)
+        # Their players at my need positions that would raise my lineup.
+        offers = []
+        for p in roster:
+            if not skill(p) or (pos and p["position"] != pos):
+                continue
+            if not pos and p["position"] not in my_needs:
+                continue
+            gain = waiver_gain(my_roster, p, shape)["lineup_gain_ros_per_game"]
+            if gain > 0:
+                offers.append((gain, p))
+        offers.sort(key=lambda t: -t[0])
+        if not offers:
+            continue
+        # What I could send: anyone of mine at a position they need, plus any
+        # bench player of mine who would start for them.
+        asks = []
+        for p in my_roster:
+            if not skill(p):
+                continue
+            gain = waiver_gain(roster, p, shape)["lineup_gain_ros_per_game"]
+            if gain > 0 and (p["position"] in their_needs or p["slot_id"] in (20, 21)):
+                asks.append((gain, p))
+        asks.sort(key=lambda t: -t[0])
+
+        # The number that matters is the net of a concrete swap, not two
+        # one-sided gains: try every 1-for-1 among the top candidates and keep
+        # the one that helps both sides the most.
+        best = None
+        for _, theirs_p in offers[:6]:
+            for _, mine_p in asks[:6]:
+                ev = evaluate_trade(my_roster, roster, [mine_p], [theirs_p], shape)
+                mine_d = ev["me"]["delta"]["starters_ros_per_game"]
+                their_d = ev["them"]["delta"]["starters_ros_per_game"]
+                score = min(mine_d, their_d)
+                if best is None or score > best["mutual_gain"]:
+                    best = {"give": mine_p["name"], "receive": theirs_p["name"],
+                            "my_gain": mine_d, "their_gain": their_d,
+                            "mutual_gain": round(score, 2)}
+        t = teams[tid]
+        partners.append({
+            **_team_brief(t),
+            "best_1_for_1": best,
+            "mutual": bool(best and best["my_gain"] > 0 and best["their_gain"] > 0),
+            "their_needs": their_needs,
+            "they_could_send": [{"my_lineup_gain": round(g, 2), **_slim_season(p)}
+                                for g, p in offers[:per_team]],
+            "i_could_send": [{"their_lineup_gain": round(g, 2), **_slim_season(p)}
+                             for g, p in asks[:per_team]],
+            "trade_block": [p["name"] for p in roster if p.get("on_trade_block")],
+        })
+    partners.sort(key=lambda t: (-t["mutual"],
+                                 -(t["best_1_for_1"] or {}).get("mutual_gain", -99),
+                                 -t["they_could_send"][0]["my_lineup_gain"]))
+
+    my_prof = profiles[me]
+    out: dict[str, Any] = {
+        "week": week,
+        "league_starter_avg_ros_per_game": avgs,
+        "my_starters_by_position": {
+            p: {"starter_avg": blk["starter_avg"], "vs_league": round(blk["starter_avg"] - avgs[p], 2)}
+            for p, blk in my_prof["positions"].items()
+            if blk["starter_avg"] is not None and p in avgs
+        },
+        "my_needs": my_needs,
+        "my_surplus": [_slim_season(p) for blk in my_prof["positions"].values()
+                       for p in blk["bench"] if (p.get("vorp") or 0) > 0
+                       and p["position"] not in ("K", "D/ST")],
+        "partners": partners,
+        "note": (
+            "my_lineup_gain / their_lineup_gain are one-sided: the change in a "
+            "team's optimal lineup (rest-of-season points per game) from adding "
+            "that player, ignoring what goes back. best_1_for_1 nets both sides "
+            "for a concrete swap; mutual=true means both lineups improve. Build "
+            "2-for-1s and check roster limits with analyze_trade."
+        ),
+    }
+    if (n := _week_note(shape)):
+        out["season_note"] = n
+    return out
 
 
 def main() -> None:

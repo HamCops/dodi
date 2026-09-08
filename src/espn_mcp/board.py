@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Config
+from .constants import SLOT_BY_ID
 from .espn import ESPNClient, ESPNError
 from .scoring import LeagueShape, normalize_player, parse_settings
+from .season import attach_ros
 from .value import build_value_board, value_vs_adp
 
 # ESPN marks an undrafted schedule slot with this player id. Real player ids
@@ -35,6 +37,12 @@ class DraftBoard:
         self._board: dict | None = None
         self._board_at: float = 0.0
         self._teams: dict | None = None
+        # In-season caches. Keyed by week where the payload depends on it.
+        self._season_boards: dict[int, tuple[float, dict]] = {}
+        self._rosters: dict[int, tuple[float, dict]] = {}
+        self._pro_schedule: dict | None = None
+        self._pro_schedule_at: float = 0.0
+        self._ratings: dict[int, tuple[float, dict]] = {}
         # Manually recorded picks. ESPN does not publish picks until a draft
         # ends, so during a live draft these ARE the draft -- persist them so a
         # new process (or a new assistant turn) does not have to be re-told
@@ -411,3 +419,197 @@ class DraftBoard:
         hits = [p for p in self.board()["players"] if q in (p["name"] or "").lower()]
         hits.sort(key=lambda p: p["vorp"], reverse=True)
         return hits[:limit]
+
+    # --- in-season --------------------------------------------------------
+
+    ROSTER_TTL = 60  # waivers and trades move rosters; keep this short
+
+    def week(self) -> int:
+        return self.shape().current_week
+
+    def pro_schedule(self) -> dict[int, dict]:
+        with self._lock:
+            fresh = (self._pro_schedule is not None
+                     and (time.time() - self._pro_schedule_at) < self.cfg.pool_ttl)
+            if fresh:
+                return self._pro_schedule
+        try:
+            sched = self.client.pro_schedule()
+        except Exception:
+            sched = {}
+        with self._lock:
+            self._pro_schedule = sched
+            self._pro_schedule_at = time.time()
+        return sched
+
+    def positional_ratings(self, week: int) -> dict[int, dict[int, dict]]:
+        with self._lock:
+            hit = self._ratings.get(week)
+            if hit and (time.time() - hit[0]) < self.cfg.pool_ttl:
+                return hit[1]
+        try:
+            ratings = self.client.positional_ratings(week)
+        except Exception:
+            ratings = {}
+        with self._lock:
+            self._ratings[week] = (time.time(), ratings)
+        return ratings
+
+    def _enrich_for_week(self, players: list[dict], week: int) -> None:
+        """Bye, NFL opponent, kickoff and opponent rank vs position, in place."""
+        shape = self.shape()
+        sched = self.pro_schedule()
+        ratings = self.positional_ratings(week)
+        for p in players:
+            team = sched.get(p.get("pro_team_id") or 0) or {}
+            p["bye_week"] = team.get("bye") or p.get("bye_week")
+            game = (team.get("games") or {}).get(week)
+            if game:
+                opp = sched.get(game["opponent_id"]) or {}
+                p["nfl_opponent"] = ("" if game["home"] else "@") + str(opp.get("abbrev") or "?")
+                p["kickoff_ms"] = game.get("kickoff_ms")
+                rank = (ratings.get(p.get("position_id") or 0) or {}).get(game["opponent_id"])
+                if rank:
+                    # ESPN's OPRK: 1 = the defense giving up the most to this
+                    # position (best matchup), 32 = the stingiest.
+                    p["opp_rank_vs_pos"] = rank.get("rank")
+            else:
+                p["nfl_opponent"] = "BYE" if team else None
+        attach_ros(players, shape.current_week, shape.final_week, week=week)
+
+    def season_board(self, week: int | None = None, refresh: bool = False) -> dict:
+        """The player pool valued over rest-of-season, with one week's projection.
+
+        Same value math as the draft board, but the projection being valued is
+        rest-of-season points, so VORP and tiers answer "how much is this
+        roster spot worth from here on" rather than "for the whole year".
+        """
+        week = week or self.week()
+        with self._lock:
+            hit = self._season_boards.get(week)
+            if hit and not refresh and (time.time() - hit[0]) < self.cfg.pool_ttl:
+                return hit[1]
+        shape = self.shape(refresh=refresh)
+        raw = self.client.player_pool(week=week)
+        players = [normalize_player(entry, self.cfg.season, shape) for entry in raw]
+        players = [p for p in players if p["position"] in ("QB", "RB", "WR", "TE", "K", "D/ST")]
+        self._enrich_for_week(players, week)
+        board = build_value_board(players, shape, key="ros_points")
+        board["week"] = week
+        board["by_id"] = {p["player_id"]: p for p in board["players"]}
+        with self._lock:
+            self._season_boards[week] = (time.time(), board)
+        return board
+
+    def league_rosters(self, week: int | None = None, refresh: bool = False) -> dict[int, dict]:
+        """Every team's roster as set for `week`, with lineup slots and standings."""
+        week = week or self.week()
+        with self._lock:
+            hit = self._rosters.get(week)
+            if hit and not refresh and (time.time() - hit[0]) < self.ROSTER_TTL:
+                return hit[1]
+        payload = self.client.rosters(week)
+        shape = self.shape()
+        teams: dict[int, dict] = {}
+        for t in payload.get("teams") or []:
+            rec = (t.get("record") or {}).get("overall") or {}
+            block = (t.get("tradeBlock") or {}).get("players") or {}
+            entries = []
+            for e in ((t.get("roster") or {}).get("entries") or []):
+                ppe = e.get("playerPoolEntry") or {}
+                rec_player = None
+                if ppe.get("player"):
+                    rec_player = normalize_player(ppe, self.cfg.season, shape)
+                entries.append({
+                    "player_id": int(e["playerId"]),
+                    "slot_id": int(e.get("lineupSlotId", 20)),
+                    "acquired": e.get("acquisitionType"),
+                    "player": rec_player,
+                })
+            counter = t.get("transactionCounter") or {}
+            teams[int(t["id"])] = {
+                "team_id": int(t["id"]),
+                "name": (t.get("name") or f"{t.get('location','')} {t.get('nickname','')}").strip(),
+                "abbrev": t.get("abbrev"),
+                "wins": rec.get("wins", 0),
+                "losses": rec.get("losses", 0),
+                "ties": rec.get("ties", 0),
+                "points_for": round(float(rec.get("pointsFor") or 0.0), 1),
+                "points_against": round(float(rec.get("pointsAgainst") or 0.0), 1),
+                "playoff_seed": t.get("playoffSeed"),
+                "waiver_rank": t.get("waiverRank"),
+                "faab_spent": counter.get("acquisitionBudgetSpent"),
+                "acquisitions": counter.get("acquisitions"),
+                "trades": counter.get("trades"),
+                "trade_block_ids": [int(pid) for pid, v in block.items() if v == "ON_THE_BLOCK"],
+                "entries": entries,
+            }
+        with self._lock:
+            self._rosters[week] = (time.time(), teams)
+        return teams
+
+    def rostered_ids(self, week: int | None = None) -> set[int]:
+        return {e["player_id"] for t in self.league_rosters(week).values() for e in t["entries"]}
+
+    def team_players(self, team_id: int, week: int | None = None) -> list[dict]:
+        """A team's players as valued records, each tagged with its lineup slot.
+
+        Records come from the season board; anyone ESPN's pool paged out
+        (deep bench) is built from the roster payload instead, so a roster is
+        never silently short a player.
+        """
+        week = week or self.week()
+        board = self.season_board(week)
+        shape = self.shape()
+        team = self.league_rosters(week).get(int(team_id))
+        if not team:
+            return []
+        out = []
+        for e in team["entries"]:
+            p = board["by_id"].get(e["player_id"])
+            if p is None and e["player"] is not None:
+                p = e["player"]
+                self._enrich_for_week([p], week)
+                base = board["replacement_points"].get(p["position"])
+                p["vorp"] = round(p["ros_points"] - base, 2) if base is not None else None
+                p["tier"] = None
+                p["value_basis"] = "vorp" if base is not None else "espn_adp"
+                p["late_round_position"] = p["position"] in ("K", "D/ST")
+            if p is None:
+                continue
+            rec = dict(p)
+            rec["slot_id"] = e["slot_id"]
+            rec["slot"] = SLOT_BY_ID.get(e["slot_id"], str(e["slot_id"]))
+            rec["acquired"] = e["acquired"]
+            rec["on_trade_block"] = e["player_id"] in team["trade_block_ids"]
+            out.append(rec)
+        return out
+
+    def season_available(self, week: int | None = None, position: str | None = None) -> list[dict]:
+        """Unrostered players by rest-of-season VORP, using the live roster set."""
+        week = week or self.week()
+        board = self.season_board(week)
+        taken = self.rostered_ids(week)
+        pool = [p for p in board["players"] if p["player_id"] not in taken]
+        if position:
+            pool = [p for p in pool if p["position"] == position.upper()]
+        return pool
+
+    def matchups(self, week: int | None = None) -> list[dict]:
+        week = week or self.week()
+        out = []
+        for m in self.client.matchups(week):
+            home, away = m.get("home") or {}, m.get("away") or {}
+            out.append({
+                "week": int(m.get("matchupPeriodId") or 0),
+                "home_team_id": int(home.get("teamId") or 0),
+                "away_team_id": int(away.get("teamId") or 0),
+                "home_points": home.get("totalPoints"),
+                "away_points": away.get("totalPoints"),
+                "home_espn_proj": home.get("totalProjectedPointsLive") or home.get("totalProjectedPoints"),
+                "away_espn_proj": away.get("totalProjectedPointsLive") or away.get("totalProjectedPoints"),
+                "home_win_prob": home.get("winProbability"),
+                "winner": m.get("winner"),
+                "playoff": m.get("playoffTierType") not in (None, "NONE"),
+            })
+        return out

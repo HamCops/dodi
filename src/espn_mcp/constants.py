@@ -100,6 +100,13 @@ PRO_TEAM_BY_ID = {
 STAT_SOURCE_ACTUAL = 0
 STAT_SOURCE_PROJECTED = 1
 STAT_SPLIT_SEASON_TOTAL = 0
+STAT_SPLIT_WEEKLY = 1
+
+# Reverse of POSITION_BY_ID for the positions the value math handles.
+POSITION_ID_BY_NAME = {name: pid for pid, name in POSITION_BY_ID.items()}
+
+# Roster slots that do not start (bench, IR).
+NON_STARTING_SLOTS = {20, 21}
 
 # Injury statuses that should be surfaced loudly during a draft.
 SERIOUS_INJURY_STATUSES = {"OUT", "INJURY_RESERVE", "SUSPENSION", "DOUBTFUL", "PUP"}

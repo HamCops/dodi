@@ -1,7 +1,8 @@
 # espn-mcp
 
 An MCP server that exposes your ESPN fantasy football league so an AI assistant
-can help you draft — live, during a snake draft, on the clock.
+can help you draft — live, during a snake draft, on the clock — and then manage
+the team through the season: start/sit by matchup, waiver claims, and trades.
 
 It does not try to pick for you. It gives the model accurate, league-specific
 facts: who is actually available, what your roster still needs, how much value
@@ -94,8 +95,19 @@ claude mcp add espn-fantasy -- "$(pwd)/.venv/bin/python" -m espn_mcp.server
 | `refresh_draft_order` | Re-read the order and your slot after a randomized draw. |
 | `refresh_board` | Force a pool re-fetch (injury news, depth chart change). |
 
+In season:
+
+| Tool | Purpose |
+|---|---|
+| `get_matchup` | **The weekly call.** Your opponent, both lineups by this week's projection, the exact start/sit swaps and what they gain, holes on either side (bye, OUT, empty slot), ESPN's win probability. Pass `week` to plan ahead. |
+| `get_waiver_targets` | Every unrostered player scored by what adding him does to your optimal lineup (rest-of-season and this week), plus drop candidates, waiver clear times and your priority/FAAB. |
+| `analyze_trade` | Both sides of a proposed trade, before and after: starting-lineup strength, this week, bench value, roster size and position limits, suggested drops. |
+| `find_trade_partners` | Which teams are weak where you are strong and vice versa, with their tradeable players, your surplus, each team's trade block, and the best 1-for-1 that helps both sides. |
+| `get_roster` | In season: a team's starters and bench with lineup slots, this week's and rest-of-season projections, positional strength. |
+
 The player pool is cached for `ESPN_POOL_TTL` seconds (default 15 min) because
-it is slow and changes slowly. Draft picks are never cached.
+it is slow and changes slowly. Draft picks are never cached; rosters are cached
+for 60 seconds because waivers and trades move them.
 
 ## During the draft
 
@@ -153,6 +165,51 @@ direction word rather than a bare signed float for exactly that reason.
 `get_draft_context` also reports `adp_as_of` and `adp_age_hours`, since the
 whole "will he last?" question rests on how current the market data is.
 
+
+## During the season
+
+Two projections matter in season and they answer different questions, so
+every in-season record carries both:
+
+- **`week_proj`** — ESPN's projection for one week. It already reflects the
+  NFL opponent, the injury designation and the bye, which is why `get_matchup`
+  uses it for start/sit: a player's season value is irrelevant to whether he
+  should start *this* week against *that* defense.
+- **`ros_pg`** — rest-of-season points per remaining game. ESPN publishes a
+  full-season projection and season-to-date actuals but no rest-of-season
+  figure, so ROS is the difference, divided by the games the player has left
+  (a bye still ahead counts against him). This is what a roster spot is worth
+  from here on, and it is the basis for in-season VORP, waiver value and trade
+  value. In week 1 it equals the draft board.
+
+Everything is measured as a change to your **optimal starting lineup**, because
+that is the only thing that scores. A waiver pickup who sits behind what you
+already have gains 0 no matter how good his projection looks; a trade is
+judged by what each side's lineup projects to before and after. The lineup is
+solved the same way for every team — dedicated slots first, then flex — so
+team strength is comparable across the league, which is how
+`find_trade_partners` spots a team weak at WR and deep at RB.
+
+Typical asks:
+
+- "Who should I start this week?" → `get_matchup`. Lists the swaps, with the
+  gain; `holes` flags a starter on bye or OUT before kickoff does.
+- "Anyone worth a claim?" → `get_waiver_targets`. `targets` is ranked by
+  lasting lineup gain, `streamers_this_week` by this week only (D/ST and K
+  live here), `best_depth_by_ros_vorp` is the stash list, and
+  `drop_candidates` is who to cut for him. `waivers_clear` says when a claim
+  processes.
+- "Is this trade good for me?" → `analyze_trade`. Give names, get both sides'
+  before/after. The partner is inferred from the players you receive.
+- "Who should I be trading with?" → `find_trade_partners`, optionally for one
+  position. `best_1_for_1` is a concrete opener that helps both lineups;
+  `mutual: false` means every fit found is lopsided.
+- "Next week I have three guys on bye" → `get_matchup(week=N)`.
+
+`opp_rank_vs_pos` is ESPN's OPRK — points a defense allows to a position, 1 =
+softest matchup, 32 = stingiest. It is empty until games have been played, so
+it appears from week 2.
+
 ## ESPN quirks handled
 
 Found by running against a real league; each has a regression test.
@@ -172,6 +229,11 @@ Found by running against a real league; each has a regression test.
   real value while staying ADP-ordered among themselves.
 - **Non-contiguous team ids.** A 10-team league can have ids `[1,2,3,6,7,8,9,
   10,12,13]`. Draft slot comes from position in the order, never from the id.
+- **Weekly projections are one week per request.** `kona_player_info` returns
+  the stat split `11{season}{week}` only when the request's `scoringPeriodId`
+  is that same week, whatever the filter asks for. Each week the season tools
+  look at is therefore its own pool fetch (about half a second), cached per
+  week.
 - **Draft time is epoch milliseconds in UTC.** Any US evening draft therefore
   reads as the *next day* in UTC — a draft the league page shows as "Mon Sep 7
   at 8:00 PM" comes back as `2026-09-08T00:00:00Z`. `get_league_settings`
@@ -248,9 +310,10 @@ before using them:
 ./.venv/bin/python -m pytest tests/ -q
 ```
 
-61 tests, no network or credentials required — the ESPN client is stubbed with
-real-shaped payloads, so the value math, snake pick ordering, board assembly and
-tool wiring are all verified offline.
+83 tests, no network or credentials required — the ESPN client is stubbed with
+real-shaped payloads, so the value math, snake pick ordering, board assembly,
+lineup solving, trade/waiver arithmetic and tool wiring are all verified
+offline.
 
 ## Layout
 
@@ -261,7 +324,8 @@ src/espn_mcp/
   constants.py   ESPN's position/slot/team id maps
   scoring.py     league shape parsing, league-scored projections
   value.py       replacement level, VORP, tiers  (pure, unit tested)
-  board.py       caching layer, draft state, snake pick math
+  season.py      rest-of-season, optimal lineups, trade/waiver deltas  (pure, unit tested)
+  board.py       caching layer, draft state, snake pick math, in-season rosters/matchups
   server.py      MCP tool definitions
 scripts/
   doctor.py      pre-draft credential and access check

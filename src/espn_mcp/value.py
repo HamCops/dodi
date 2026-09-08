@@ -21,7 +21,8 @@ VALUE_POSITIONS = ("QB", "RB", "WR", "TE", "K", "D/ST")
 LATE_ROUND_POSITIONS = frozenset({"K", "D/ST"})
 
 
-def replacement_ranks(players: list[dict], shape: LeagueShape) -> dict[str, int]:
+def replacement_ranks(players: list[dict], shape: LeagueShape,
+                      key: str = "projected_points") -> dict[str, int]:
     """How many players at each position are startable league-wide.
 
     Dedicated slots are simply teams x slots. Flex slots are allocated
@@ -37,14 +38,14 @@ def replacement_ranks(players: list[dict], shape: LeagueShape) -> dict[str, int]
     for p in players:
         by_pos.setdefault(p["position"], []).append(p)
     for pos_players in by_pos.values():
-        pos_players.sort(key=lambda p: p["projected_points"], reverse=True)
+        pos_players.sort(key=lambda p: p[key], reverse=True)
 
     for eligible, slot_count in shape.flex_slots.items():
         remaining: list[dict] = []
         for pos in eligible:
             already = ranks.get(pos, 0)
             remaining.extend(by_pos.get(pos, [])[already:])
-        remaining.sort(key=lambda p: p["projected_points"], reverse=True)
+        remaining.sort(key=lambda p: p[key], reverse=True)
         for p in remaining[: teams * slot_count]:
             ranks[p["position"]] = ranks.get(p["position"], 0) + 1
 
@@ -53,11 +54,12 @@ def replacement_ranks(players: list[dict], shape: LeagueShape) -> dict[str, int]
     return ranks
 
 
-def replacement_points(players: list[dict], ranks: dict[str, int]) -> dict[str, float]:
+def replacement_points(players: list[dict], ranks: dict[str, int],
+                       key: str = "projected_points") -> dict[str, float]:
     """Projection of the first player *below* the startable cutoff."""
     by_pos: dict[str, list[float]] = {}
     for p in players:
-        by_pos.setdefault(p["position"], []).append(p["projected_points"])
+        by_pos.setdefault(p["position"], []).append(p[key])
 
     out: dict[str, float] = {}
     for pos, points in by_pos.items():
@@ -149,7 +151,7 @@ def assign_tiers(players: list[dict], ranks: dict[str, int], teams: int,
             p["tier"] = last
 
 
-def unprojected_positions(players: list[dict]) -> set[str]:
+def unprojected_positions(players: list[dict], key: str = "projected_points") -> set[str]:
     """Positions ESPN publishes no season projections for.
 
     D/ST is the standing example: every defense comes back with 0.0, so VORP
@@ -160,7 +162,7 @@ def unprojected_positions(players: list[dict]) -> set[str]:
     best: dict[str, float] = {}
     for p in players:
         pos = p["position"]
-        best[pos] = max(best.get(pos, 0.0), p["projected_points"])
+        best[pos] = max(best.get(pos, 0.0), p[key])
     return {pos for pos, top in best.items() if top <= 0.0}
 
 
@@ -175,11 +177,16 @@ def _adp_sort_key(p: dict) -> tuple:
     )
 
 
-def build_value_board(players: list[dict], shape: LeagueShape) -> dict:
-    """Attach VORP + tier to every player and return the board with metadata."""
-    ranks = replacement_ranks(players, shape)
-    baselines = replacement_points(players, ranks)
-    no_projections = unprojected_positions(players)
+def build_value_board(players: list[dict], shape: LeagueShape,
+                      key: str = "projected_points") -> dict:
+    """Attach VORP + tier to every player and return the board with metadata.
+
+    `key` is the projection to value over: the full-season projection for a
+    draft, or rest-of-season points once the season is under way.
+    """
+    ranks = replacement_ranks(players, shape, key)
+    baselines = replacement_points(players, ranks, key)
+    no_projections = unprojected_positions(players, key)
 
     valued: list[dict] = []
     unvalued: list[dict] = []
@@ -196,7 +203,7 @@ def build_value_board(players: list[dict], shape: LeagueShape) -> dict:
             baseline = baselines.get(pos, 0.0)
             p["value_basis"] = "vorp"
             p["replacement_points"] = round(baseline, 2)
-            p["vorp"] = round(p["projected_points"] - baseline, 2)
+            p["vorp"] = round(p[key] - baseline, 2)
             valued.append(p)
 
     assign_tiers(valued, ranks, shape.teams)

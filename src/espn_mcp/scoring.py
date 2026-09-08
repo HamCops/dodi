@@ -17,8 +17,10 @@ from .constants import (
     POSITION_BY_ID,
     PRO_TEAM_BY_ID,
     SLOT_BY_ID,
+    STAT_SOURCE_ACTUAL,
     STAT_SOURCE_PROJECTED,
     STAT_SPLIT_SEASON_TOTAL,
+    STAT_SPLIT_WEEKLY,
 )
 
 # statId for receptions, used only to describe the league in human terms.
@@ -47,6 +49,17 @@ class LeagueShape:
     lineup_slots: dict[int, int]
     scoring_items: list[ScoringItem]
     roster_size: int
+    # --- in-season fields (from mStatus / acquisition / trade settings) ---
+    current_week: int = 1
+    final_week: int = 17
+    regular_season_weeks: int | None = None
+    playoff_teams: int | None = None
+    is_active: bool = False
+    # position -> max rostered (None = unlimited)
+    position_limits: dict[str, int] = field(default_factory=dict)
+    waivers: dict = field(default_factory=dict)
+    trade_deadline_ms: int | None = None
+    trade_veto_votes: int | None = None
 
     @property
     def starters_by_position(self) -> dict[str, int]:
@@ -122,7 +135,29 @@ class LeagueShape:
             },
             "bench_spots": self.lineup_slots.get(20, 0),
             "ir_spots": self.lineup_slots.get(21, 0),
+            **self.season_describe(),
         }
+
+    def season_describe(self) -> dict:
+        """The in-season facts: week, waiver rules, trade deadline, roster limits."""
+        out: dict = {
+            "season_active": self.is_active,
+            "current_week": self.current_week,
+            "final_week": self.final_week,
+            "regular_season_weeks": self.regular_season_weeks,
+            "playoff_teams": self.playoff_teams,
+            "position_limits": self.position_limits,
+            "waivers": self.waivers,
+        }
+        if self.trade_deadline_ms:
+            dt = datetime.fromtimestamp(self.trade_deadline_ms / 1000, timezone.utc)
+            out["trade_deadline_local"] = (
+                dt.astimezone().strftime("%a %b %d, %Y at %I:%M %p %Z").replace(" 0", " ")
+            )
+            out["trade_deadline_passed"] = dt <= datetime.now(timezone.utc)
+        if self.trade_veto_votes is not None:
+            out["trade_veto_votes_required"] = self.trade_veto_votes
+        return out
 
 
 def parse_settings(payload: dict) -> LeagueShape:
@@ -148,6 +183,43 @@ def parse_settings(payload: dict) -> LeagueShape:
 
     teams = int(settings.get("size") or len(payload.get("teams") or []) or 0)
 
+    # --- in-season -------------------------------------------------------
+    status = payload.get("status") or {}
+    current_week = int(
+        status.get("latestScoringPeriod")
+        or status.get("currentMatchupPeriod")
+        or payload.get("scoringPeriodId")
+        or 1
+    )
+    final_week = int(status.get("finalScoringPeriod") or 17)
+    sched = settings.get("scheduleSettings") or {}
+    acq = settings.get("acquisitionSettings") or {}
+    trade = settings.get("tradeSettings") or {}
+    limits: dict[str, int] = {}
+    for pid, cap in (roster.get("positionLimits") or {}).items():
+        pos = POSITION_BY_ID.get(int(pid))
+        if pos and int(cap) >= 0:
+            limits[pos] = int(cap)
+    waivers: dict = {}
+    if acq:
+        kind = str(acq.get("acquisitionType") or "")
+        waivers = {
+            "type": kind,
+            "uses_faab": bool(acq.get("isUsingAcquisitionBudget")),
+            "faab_budget": acq.get("acquisitionBudget") if acq.get("isUsingAcquisitionBudget") else None,
+            "minimum_bid": acq.get("minimumBid") if acq.get("isUsingAcquisitionBudget") else None,
+            "waiver_hours": acq.get("waiverHours"),
+            "process_days": acq.get("waiverProcessDays"),
+            "process_hour": acq.get("waiverProcessHour"),
+            "season_acquisition_limit": (
+                None if (acq.get("acquisitionLimit") in (None, -1)) else acq.get("acquisitionLimit")
+            ),
+            "per_matchup_acquisition_limit": (
+                None if (acq.get("matchupAcquisitionLimit") in (None, -1, -1.0))
+                else acq.get("matchupAcquisitionLimit")
+            ),
+        }
+
     return LeagueShape(
         name=settings.get("name") or "Unnamed league",
         teams=teams,
@@ -158,6 +230,15 @@ def parse_settings(payload: dict) -> LeagueShape:
         lineup_slots=lineup_slots,
         scoring_items=items,
         roster_size=sum(lineup_slots.values()),
+        current_week=current_week,
+        final_week=final_week,
+        regular_season_weeks=sched.get("matchupPeriodCount"),
+        playoff_teams=sched.get("playoffTeamCount"),
+        is_active=bool(status.get("isActive")),
+        position_limits=limits,
+        waivers=waivers,
+        trade_deadline_ms=int(trade["deadlineDate"]) if trade.get("deadlineDate") else None,
+        trade_veto_votes=trade.get("vetoVotesRequired"),
     )
 
 
@@ -170,6 +251,45 @@ def _season_projection_entry(player: dict, season: int) -> dict | None:
         ):
             return entry
     return None
+
+
+def _stat_total(entry: dict, position_id: int, shape: LeagueShape) -> float:
+    applied = entry.get("appliedTotal")
+    if applied is not None:
+        return round(float(applied), 2)
+    return round(score_stat_line(entry.get("stats") or {}, position_id, shape.scoring_items), 2)
+
+
+def season_actual_points(player: dict, season: int, shape: LeagueShape) -> float:
+    """League-scored points actually scored so far this season."""
+    pos_id = int(player.get("defaultPositionId") or 0)
+    for entry in player.get("stats") or []:
+        if (
+            entry.get("statSourceId") == STAT_SOURCE_ACTUAL
+            and entry.get("statSplitTypeId") == STAT_SPLIT_SEASON_TOTAL
+            and int(entry.get("seasonId") or 0) == season
+        ):
+            return _stat_total(entry, pos_id, shape)
+    return 0.0
+
+
+def weekly_projections(player: dict, season: int, shape: LeagueShape) -> dict[int, float]:
+    """week -> league-scored projection, for whichever weeks ESPN returned.
+
+    ESPN only returns the projection for the week named by the request's
+    `scoringPeriodId`, so this is normally a single entry.
+    """
+    pos_id = int(player.get("defaultPositionId") or 0)
+    out: dict[int, float] = {}
+    for entry in player.get("stats") or []:
+        if (
+            entry.get("statSourceId") == STAT_SOURCE_PROJECTED
+            and entry.get("statSplitTypeId") == STAT_SPLIT_WEEKLY
+            and int(entry.get("seasonId") or 0) == season
+            and entry.get("scoringPeriodId")
+        ):
+            out[int(entry["scoringPeriodId"])] = _stat_total(entry, pos_id, shape)
+    return out
 
 
 def score_stat_line(stats: dict, position_id: int, items: list[ScoringItem]) -> float:
@@ -220,14 +340,25 @@ def normalize_player(entry: dict, season: int, shape: LeagueShape) -> dict:
     if abs(adp_change) >= 0.05:
         adp_moving = "later" if adp_change > 0 else "earlier"
 
+    # Roster status lives on the pool entry, not the player.
+    status = entry.get("status") if entry is not player else None
+    on_team = int(entry.get("onTeamId") or 0) if entry is not player else 0
+    waiver_clears = entry.get("waiverProcessDate") if entry is not player else None
+
     return {
         "player_id": int(player.get("id")),
         "name": player.get("fullName"),
         "position": POSITION_BY_ID.get(pos_id, str(pos_id)),
         "position_id": pos_id,
         "pro_team": PRO_TEAM_BY_ID.get(int(player.get("proTeamId") or 0), "FA"),
+        "pro_team_id": int(player.get("proTeamId") or 0),
         "bye_week": None,  # filled in by the board from proTeam bye data when present
         "projected_points": projected_points(player, season, shape),
+        "season_points": season_actual_points(player, season, shape),
+        "week_projections": weekly_projections(player, season, shape),
+        "roster_status": status,          # FREEAGENT / WAIVERS / ONTEAM
+        "on_team_id": on_team or None,
+        "waiver_clears_ms": waiver_clears,
         "espn_adp": round(float(ownership.get("averageDraftPosition") or 0.0), 1) or None,
         "adp_change_pct": round(adp_change, 3),
         "adp_moving": adp_moving,
