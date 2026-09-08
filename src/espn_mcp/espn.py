@@ -16,6 +16,9 @@ from .config import Config
 
 BASE = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
 
+# The only domain the login cookies may ever be sent to.
+COOKIE_DOMAIN = ".espn.com"
+
 # ESPN rejects requests without a browser-ish UA from some networks.
 _HEADERS = {
     "User-Agent": (
@@ -33,9 +36,12 @@ class ESPNError(RuntimeError):
 class ESPNClient:
     def __init__(self, cfg: Config, timeout: float = 20.0) -> None:
         self.cfg = cfg
-        cookies = {}
+        # Scope the session cookies to ESPN. A plain dict makes httpx attach
+        # them to every host, so a redirect off espn.com would leak the login.
+        cookies = httpx.Cookies()
         if cfg.has_auth:
-            cookies = {"espn_s2": cfg.espn_s2, "SWID": cfg.swid}
+            cookies.set("espn_s2", cfg.espn_s2, domain=COOKIE_DOMAIN)
+            cookies.set("SWID", cfg.swid, domain=COOKIE_DOMAIN)
         self._client = httpx.Client(
             headers=_HEADERS, cookies=cookies, timeout=timeout, follow_redirects=True
         )
