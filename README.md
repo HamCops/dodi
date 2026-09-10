@@ -102,6 +102,7 @@ In season:
 | `get_matchup` | **The weekly call.** Your opponent, both lineups by this week's projection, the exact start/sit swaps and what they gain, holes on either side (bye, OUT, empty slot), ESPN's win probability. Pass `week` to plan ahead. |
 | `get_waiver_targets` | Every unrostered player scored by what adding him does to your optimal lineup (rest-of-season and this week), plus drop candidates, waiver clear times and your priority/FAAB. |
 | `analyze_trade` | Both sides of a proposed trade, before and after: starting-lineup strength, this week, bench value, roster size and position limits, suggested drops. |
+| `get_transactions` | The league's transaction log, newest first: every lineup move (player, from slot, to slot), add, drop, waiver claim and trade, with team and timestamp. Filter by team, week or kind. The only view of history; rosters show the present. |
 | `find_trade_partners` | Which teams are weak where you are strong and vice versa, with their tradeable players, your surplus, each team's trade block, and the best 1-for-1 that helps both sides. |
 | `get_roster` | In season: a team's starters and bench with lineup slots, this week's and rest-of-season projections, positional strength. |
 

@@ -21,6 +21,7 @@ from espn_mcp.season import (  # noqa: E402
     ROS_KEY,
     WEEK_KEY,
     attach_ros,
+    describe_transaction,
     drop_candidates,
     evaluate_trade,
     lineup_changes,
@@ -293,6 +294,29 @@ class SeasonClient(FakeClient):
             })
         return {"teams": teams}
 
+    def transactions(self) -> list[dict]:
+        """A draft pick, a lineup swap by team 1, and a waiver claim by team 2."""
+        t1 = self.drafted[1]
+        t2 = self.drafted[2]
+        return [
+            {"id": "d1", "type": "DRAFT", "status": "EXECUTED", "teamId": 1,
+             "scoringPeriodId": 0, "proposedDate": 1_000_000,
+             "items": [{"type": "DRAFT", "playerId": t1[0]["id"], "fromLineupSlotId": -1,
+                        "toLineupSlotId": 0}]},
+            {"id": "r1", "type": "ROSTER", "status": "EXECUTED", "teamId": 1,
+             "scoringPeriodId": WEEK, "proposedDate": 3_000_000,
+             "items": [{"type": "LINEUP", "playerId": t1[2]["id"], "fromLineupSlotId": 20,
+                        "toLineupSlotId": 2},
+                       {"type": "LINEUP", "playerId": t1[3]["id"], "fromLineupSlotId": 2,
+                        "toLineupSlotId": 20}]},
+            {"id": "w1", "type": "WAIVER", "status": "EXECUTED", "teamId": 2,
+             "scoringPeriodId": WEEK, "proposedDate": 2_000_000, "bidAmount": 7,
+             "items": [{"type": "ADD", "playerId": 999_999, "fromLineupSlotId": -1,
+                        "toLineupSlotId": 20},
+                       {"type": "DROP", "playerId": t2[-1]["id"], "fromLineupSlotId": 20,
+                        "toLineupSlotId": -1}]},
+        ]
+
     def matchups(self, week: int) -> list[dict]:
         ids = list(range(1, TEAMS + 1))
         out = []
@@ -477,3 +501,63 @@ def test_draft_tools_still_work_in_season():
     """The draft board and the season board are separate caches."""
     out = call("get_available_players", limit=3)
     assert out["count"] == 3 and "proj" in out["players"][0]
+
+
+def test_describe_transaction_reads_lineup_moves_and_waivers():
+    names = {10: "A. Back", 11: "B. Back", 12: "C. Wideout"}
+    teams = {1: "Alpha", 2: "Bravo"}
+    move = describe_transaction(
+        {"id": "x", "type": "ROSTER", "status": "EXECUTED", "teamId": 1,
+         "scoringPeriodId": 3, "proposedDate": 5,
+         "items": [{"type": "LINEUP", "playerId": 10, "fromLineupSlotId": 20, "toLineupSlotId": 23},
+                   {"type": "LINEUP", "playerId": 11, "fromLineupSlotId": 23, "toLineupSlotId": 20}]},
+        names.get, teams.get)
+    assert move["kind"] == "lineup" and move["team"] == "Alpha" and move["week"] == 3
+    assert move["items"][0] == {"action": "LINEUP", "player_id": 10, "player": "A. Back",
+                                "from": "BE", "to": "FLEX"}
+    assert move["summary"] == "A. Back BE -> FLEX; B. Back FLEX -> BE"
+
+    claim = describe_transaction(
+        {"id": "y", "type": "WAIVER", "status": "EXECUTED", "teamId": 2, "bidAmount": 12,
+         "scoringPeriodId": 3, "proposedDate": 6,
+         "items": [{"type": "ADD", "playerId": 12, "fromLineupSlotId": -1, "toLineupSlotId": 20},
+                   {"type": "DROP", "playerId": 77, "fromLineupSlotId": 20, "toLineupSlotId": -1}]},
+        names.get, teams.get)
+    assert claim["kind"] == "waiver" and claim["bid"] == 12
+    assert claim["summary"] == "+C. Wideout; -player 77"
+    assert claim["items"][1]["from"] == "BE" and "to" not in claim["items"][1]
+
+    trade = describe_transaction(
+        {"id": "z", "type": "TRADE_ACCEPT", "status": "EXECUTED", "teamId": 1,
+         "scoringPeriodId": 3, "proposedDate": 7,
+         "items": [{"type": "TRADE", "playerId": 10, "fromTeamId": 1, "toTeamId": 2}]},
+        names.get, teams.get)
+    assert trade["kind"] == "trade"
+    assert trade["items"][0]["from_team"] == "Alpha" and trade["items"][0]["to_team"] == "Bravo"
+
+
+def test_get_transactions_hides_draft_filters_and_names_players():
+    out = call("get_transactions")
+    kinds = [t["kind"] for t in out["transactions"]]
+    assert "draft" not in kinds
+    assert kinds == ["lineup", "waiver"]  # newest first
+    assert out["total"] == 2 and out["my_team_id"] == CFG.team_id
+    move = out["transactions"][0]
+    assert move["team_id"] == 1 and move["week"] == WEEK and move["when"]
+    assert all(i["player"] and not i["player"].startswith("player ") for i in move["items"])
+    assert move["items"][0]["to"] == "RB" and move["items"][1]["to"] == "BE"
+
+    claim = out["transactions"][1]
+    assert claim["bid"] == 7
+    # A player outside every roster and the pool falls back to the id.
+    assert claim["items"][0]["player"] == "player 999999"
+
+    only_two = call("get_transactions", team_id=2)
+    assert [t["team_id"] for t in only_two["transactions"]] == [2]
+    assert only_two["team"]
+
+    drafted = call("get_transactions", kind="draft")
+    assert [t["kind"] for t in drafted["transactions"]] == ["draft"]
+
+    with_draft = call("get_transactions", include_draft=True, limit=1)
+    assert with_draft["shown"] == 1 and with_draft["total"] == 3

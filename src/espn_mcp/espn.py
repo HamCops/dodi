@@ -176,6 +176,12 @@ class ESPNClient:
         """Live draft state. Never cache this."""
         return self.league(["mDraftDetail", "mTeam"])
 
+    def transactions(self) -> list[dict]:
+        """Every transaction this season: draft picks, adds, drops, waivers,
+        trades and lineup moves, each with a team, timestamp and week."""
+        data = self.league(["mTransactions2"])
+        return data.get("transactions") or []
+
     def pro_team_byes(self) -> dict[int, int]:
         """proTeamId -> bye week. Not on the player record; a separate view."""
         data = self._get(f"{BASE}/seasons/{self.cfg.season}",

@@ -22,6 +22,7 @@ from .season import (
     ROS_KEY,
     WEEK_KEY,
     current_starters,
+    describe_transaction,
     drop_candidates,
     evaluate_trade,
     league_position_averages,
@@ -41,7 +42,8 @@ mcp = MCPServer(
         "best-available in one call. IN SEASON: get_matchup for this week's game "
         "and start/sit, get_waiver_targets for who to add and drop, analyze_trade "
         "to evaluate a specific offer, find_trade_partners to see which teams have "
-        "what you need. Rankings are by VORP (value over replacement), which already "
+        "what you need, get_transactions for history (lineup moves, adds, drops, "
+        "trades, with timestamps; rosters only show the present). Rankings are by VORP (value over replacement), which already "
         "accounts for positional scarcity in this league's specific lineup; do not "
         "re-rank by raw projected points. In season, VORP is over rest-of-season "
         "points; week_proj is ESPN's single-week projection and already reflects "
@@ -1130,6 +1132,75 @@ def analyze_trade(give: list[str], receive: list[str],
         out["trade_deadline_passed"] = deadline["trade_deadline_passed"]
     if shape.trade_veto_votes:
         out["veto_votes_required"] = shape.trade_veto_votes
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def get_transactions(team_id: int | None = None, week: int | None = None,
+                     kind: str | None = None, limit: int = 40,
+                     include_draft: bool = False) -> dict:
+    """The league's transaction log, newest first: who changed what, and when.
+
+    Every lineup move (player, from slot, to slot), add, drop, waiver claim
+    and trade this season, with the team and a timestamp. This is the only
+    way to see history -- rosters show the current state only. Use it to
+    answer "has my opponent touched his lineup this week", "who picked up X
+    and when", or "did he swap someone in and back out".
+
+    team_id: one team only (omit for the whole league).
+    week: one scoring period only.
+    kind: "lineup", "add_drop", "waiver", "trade" or "draft".
+    include_draft: draft picks are excluded unless asked for; they swamp
+    everything else.
+    """
+    b = board()
+    raw = b.client.transactions()
+    teams = b.league_rosters(week or b.week())
+    names: dict[int, str] = {}
+    for t in teams.values():
+        for e in t["entries"]:
+            if e.get("player"):
+                names[e["player_id"]] = e["player"]["name"]
+
+    def name_of(pid: int) -> str | None:
+        if pid in names:
+            return names[pid]
+        p = b.player(pid)
+        return p["name"] if p else None
+
+    def team_of(tid) -> str | None:
+        t = teams.get(int(tid)) if tid is not None else None
+        return t["name"] if t else None
+
+    rows = []
+    for t in raw:
+        rec = describe_transaction(t, name_of, team_of)
+        if rec["kind"] == "draft" and not include_draft and kind != "draft":
+            continue
+        if team_id is not None and rec["team_id"] != int(team_id):
+            continue
+        if week is not None and rec["week"] != int(week):
+            continue
+        if kind and rec["kind"] != kind:
+            continue
+        rows.append(rec)
+    rows.sort(key=lambda r: r["date_ms"] or 0, reverse=True)
+    total = len(rows)
+    rows = rows[:max(1, int(limit))]
+    for r in rows:
+        r["when"] = _local_time(r["date_ms"], "%a %b %d %I:%M %p")
+    out = {
+        "transactions": rows,
+        "shown": len(rows),
+        "total": total,
+        "filters": {"team_id": team_id, "week": week, "kind": kind,
+                    "include_draft": include_draft},
+    }
+    if team_id is not None and team_of(team_id):
+        out["team"] = team_of(team_id)
+    if b.cfg.team_id:
+        out["my_team_id"] = b.cfg.team_id
     return out
 
 

@@ -307,3 +307,77 @@ def drop_candidates(roster: list[dict], shape: LeagueShape, limit: int = 4,
     bench = [p for p in bench if p["position"] not in late or p["position"] == protect_position]
     bench.sort(key=lambda p: (_val(p, "vorp"), _val(p, ROS_KEY)))
     return bench[:limit]
+
+
+# --------------------------------------------------------------------------
+# Transaction log
+# --------------------------------------------------------------------------
+
+# ESPN transaction types, grouped into what a manager would call them.
+TRANSACTION_KIND = {
+    "ROSTER": "lineup",
+    "FUTURE_ROSTER": "lineup",
+    "FREEAGENT": "add_drop",
+    "WAIVER": "waiver",
+    "TRADE_PROPOSAL": "trade",
+    "TRADE_ACCEPT": "trade",
+    "TRADE_DECLINE": "trade",
+    "TRADE_VETO": "trade",
+    "TRADE_UPHOLD": "trade",
+    "DRAFT": "draft",
+}
+
+
+def _slot_label(slot_id) -> str | None:
+    if slot_id is None or int(slot_id) < 0:
+        return None
+    return SLOT_BY_ID.get(int(slot_id), str(slot_id))
+
+
+def describe_transaction(t: dict, name_of, team_of) -> dict:
+    """One ESPN transaction as a readable record.
+
+    `name_of(player_id)` and `team_of(team_id)` resolve ids to names; either
+    may return None, in which case the id is shown instead.
+    """
+    kind = TRANSACTION_KIND.get(t.get("type"), "other")
+    items, parts = [], []
+    for i in t.get("items") or []:
+        pid = int(i.get("playerId") or 0)
+        name = name_of(pid) or f"player {pid}"
+        action = i.get("type")
+        row: dict = {"action": action, "player_id": pid, "player": name}
+        if action == "LINEUP":
+            row["from"] = _slot_label(i.get("fromLineupSlotId"))
+            row["to"] = _slot_label(i.get("toLineupSlotId"))
+            parts.append(f"{name} {row['from']} -> {row['to']}")
+        elif action in ("ADD", "DRAFT"):
+            row["to"] = _slot_label(i.get("toLineupSlotId"))
+            parts.append(f"+{name}")
+        elif action == "DROP":
+            row["from"] = _slot_label(i.get("fromLineupSlotId"))
+            parts.append(f"-{name}")
+        elif action == "TRADE":
+            src, dst = i.get("fromTeamId"), i.get("toTeamId")
+            row["from_team"] = team_of(src) or src
+            row["to_team"] = team_of(dst) or dst
+            parts.append(f"{name}: {row['from_team']} -> {row['to_team']}")
+        else:
+            parts.append(f"{action} {name}")
+        items.append(row)
+    tid = t.get("teamId")
+    out = {
+        "id": t.get("id"),
+        "kind": kind,
+        "type": t.get("type"),
+        "status": t.get("status"),
+        "team_id": tid,
+        "team": team_of(tid) or tid,
+        "week": t.get("scoringPeriodId"),
+        "date_ms": t.get("proposedDate") or t.get("processDate"),
+        "summary": "; ".join(parts),
+        "items": items,
+    }
+    if kind == "waiver" and t.get("bidAmount"):
+        out["bid"] = t["bidAmount"]
+    return out
