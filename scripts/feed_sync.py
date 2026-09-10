@@ -17,8 +17,8 @@ never touches ESPN's fantasy API or the cookies.
                                            including K and D/ST, which the
                                            play parser cannot score.
 
-Run it once, or as a loop that re-syncs the lineups every 15 minutes and the
-live totals every minute while games are on:
+Run it once, or as a loop: every 15 minutes while nothing is on, every minute
+(lineups and live totals both) while games are live:
 
   ./.venv/bin/python scripts/feed_sync.py --once
   ./.venv/bin/python scripts/feed_sync.py --loop
@@ -269,11 +269,14 @@ def run_loop(args) -> int:
     while True:
         try:
             week = args.week or b.week()
-            if time.time() - last_favorites > 15 * 60:
+            live = feed_is_live()
+            # Lineups change right up to kickoff and between games, so while
+            # the slate is live re-sync them every pass, not just every 15 min.
+            if live or time.time() - last_favorites > 15 * 60:
                 sync_favorites(b, week)
                 last_favorites = time.time()
             sync_live(b, week)
-            delay = 60 if feed_is_live() else 15 * 60
+            delay = 60 if live else 15 * 60
         except ESPNError as exc:
             print(f"espn: {exc}", file=sys.stderr)
             delay = 5 * 60

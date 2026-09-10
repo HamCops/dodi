@@ -225,8 +225,9 @@ cookies; this script does the fantasy-API reads.
 ./.venv/bin/python scripts/feed_sync.py --install-service # then enable the unit it prints
 ```
 
-The service re-syncs lineups every 15 minutes and live totals every minute
-while the plugin reports games in progress.
+The service re-syncs every 15 minutes while nothing is on. While the plugin
+reports games in progress it re-syncs every minute, lineups included, so a
+start/sit change on ESPN reaches the bar within a minute.
 
 ## ESPN quirks handled
 
