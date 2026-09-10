@@ -8,7 +8,9 @@ header, which is where paging, status filtering and stat-window selection live.
 from __future__ import annotations
 
 import json
+from http.cookiejar import Cookie
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -16,8 +18,20 @@ from .config import Config
 
 BASE = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
 
-# The only domain the login cookies may ever be sent to.
+# The only domain the login cookies may ever be sent to, and the only one a
+# request may start at: anything else is refused before it is made, so no
+# future call site can point the session elsewhere. Redirects are followed,
+# so the cookies are also marked Secure: an https-to-http hop, even inside
+# espn.com, goes without them.
 COOKIE_DOMAIN = ".espn.com"
+ALLOWED_HOST_SUFFIX = ".espn.com"
+
+
+def host_allowed(url: str) -> bool:
+    """True for https URLs on espn.com or a subdomain of it."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and (host == "espn.com" or host.endswith(ALLOWED_HOST_SUFFIX))
 
 # ESPN rejects requests without a browser-ish UA from some networks.
 _HEADERS = {
@@ -27,6 +41,16 @@ _HEADERS = {
     ),
     "Accept": "application/json",
 }
+
+
+def _secure_cookie(name: str, value: str) -> Cookie:
+    """A session cookie scoped to ESPN and flagged Secure (https only)."""
+    return Cookie(
+        version=0, name=name, value=value, port=None, port_specified=False,
+        domain=COOKIE_DOMAIN, domain_specified=True, domain_initial_dot=True,
+        path="/", path_specified=True, secure=True, expires=None, discard=True,
+        comment=None, comment_url=None, rest={}, rfc2109=False,
+    )
 
 
 class ESPNError(RuntimeError):
@@ -40,14 +64,20 @@ class ESPNClient:
         # them to every host, so a redirect off espn.com would leak the login.
         cookies = httpx.Cookies()
         if cfg.has_auth:
-            cookies.set("espn_s2", cfg.espn_s2, domain=COOKIE_DOMAIN)
-            cookies.set("SWID", cfg.swid, domain=COOKIE_DOMAIN)
+            for name, value in (("espn_s2", cfg.espn_s2), ("SWID", cfg.swid)):
+                cookies.jar.set_cookie(_secure_cookie(name, value))
         self._client = httpx.Client(
             headers=_HEADERS, cookies=cookies, timeout=timeout, follow_redirects=True
         )
 
     def close(self) -> None:
         self._client.close()
+
+    def _scrub(self, text: str) -> str:
+        """Strip the session cookies out of anything that becomes an error message."""
+        for secret in self.cfg.secrets:
+            text = text.replace(secret, "***")
+        return text
 
     @property
     def _league_url(self) -> str:
@@ -62,10 +92,14 @@ class ESPNClient:
         # httpx encodes a list value as repeated keys, which is what ESPN wants.
         query["view"] = views
 
+        if not host_allowed(url):
+            raise ESPNError(f"Refusing to call a non-ESPN URL: {url}")
         try:
             resp = self._client.get(url, params=query, headers=headers)
         except httpx.HTTPError as exc:
-            raise ESPNError(f"Network error talking to ESPN: {exc}") from exc
+            # Scrub the cause too: a formatted traceback prints it verbatim.
+            exc.args = tuple(self._scrub(a) if isinstance(a, str) else a for a in exc.args)
+            raise ESPNError(self._scrub(f"Network error talking to ESPN: {exc}")) from exc
 
         if resp.status_code in (401, 403):
             raise ESPNError(
@@ -80,7 +114,7 @@ class ESPNClient:
                 "Check ESPN_LEAGUE_ID and ESPN_SEASON."
             )
         if resp.status_code >= 400:
-            raise ESPNError(f"ESPN returned HTTP {resp.status_code}: {resp.text[:300]}")
+            raise ESPNError(f"ESPN returned HTTP {resp.status_code}: {self._scrub(resp.text)[:300]}")
 
         try:
             return resp.json()
