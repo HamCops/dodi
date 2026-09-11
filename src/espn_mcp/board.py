@@ -599,6 +599,10 @@ class DraftBoard:
         week = week or self.week()
         out = []
         for m in self.client.matchups(week):
+            # ESPN returns the whole season's schedule regardless of
+            # scoringPeriodId; keep only this week's games.
+            if int(m.get("matchupPeriodId") or 0) != week:
+                continue
             home, away = m.get("home") or {}, m.get("away") or {}
             out.append({
                 "week": int(m.get("matchupPeriodId") or 0),
