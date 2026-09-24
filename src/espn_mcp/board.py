@@ -548,6 +548,14 @@ class DraftBoard:
             self._rosters[week] = (time.time(), teams)
         return teams
 
+    def invalidate_rosters(self, week: int | None = None) -> None:
+        """Forget cached rosters (one week, or all) so the next read refetches."""
+        with self._lock:
+            if week is None:
+                self._rosters.clear()
+            else:
+                self._rosters.pop(week, None)
+
     def rostered_ids(self, week: int | None = None) -> set[int]:
         return {e["player_id"] for t in self.league_rosters(week).values() for e in t["entries"]}
 

@@ -356,7 +356,7 @@ class SeasonClient(FakeClient):
             return build_pool()
         return [self._with_week(e, week) for e in build_pool()]
 
-    def rosters(self, week: int) -> dict:
+    def _live_rosters(self, week: int) -> dict:
         teams = []
         for t in range(1, TEAMS + 1):
             entries = self.drafted[t]
@@ -399,7 +399,23 @@ class SeasonClient(FakeClient):
     trade_proposal_transaction = ESPNClient.trade_proposal_transaction
     trade_response_transaction = ESPNClient.trade_response_transaction
 
+    # Read lag: after a write, serve the pre-write roster for `lag` reads,
+    # like ESPN's read replicas do for a moment.
+    lag = 0
+
+    def _begin_lag(self) -> None:
+        if self.lag:
+            self._stale = self.rosters(WEEK)
+            self._lag_left = self.lag
+
+    def rosters(self, week: int) -> dict:
+        if getattr(self, "_lag_left", 0) > 0:
+            self._lag_left -= 1
+            return self._stale
+        return self._live_rosters(week)
+
     def post_transaction(self, body: dict) -> dict:
+        self._begin_lag()
         self.posts = getattr(self, "posts", [])
         self.posts.append(body)
         self.proposals = getattr(self, "proposals", [])
@@ -428,6 +444,7 @@ class SeasonClient(FakeClient):
         raise AssertionError(body["type"])
 
     def set_lineup(self, team_id: int, week: int, moves: list[dict]) -> dict:
+        self._begin_lag()
         self.writes = getattr(self, "writes", [])
         self.writes.append({"team_id": team_id, "week": week, "moves": moves})
         overrides = self.slot_overrides = getattr(self, "slot_overrides", {})
@@ -726,6 +743,50 @@ def test_add_player_files_a_waiver_claim_for_a_player_on_waivers(monkeypatch):
         body = b.client.posts[0]
         assert body["type"] == "WAIVER" and body["executionType"] == "PROCESS"
         assert done["espn_status"] == "PENDING" and "waiver run" in done["note"]
+    finally:
+        srv._board = None
+
+
+def test_writes_wait_for_espn_reads_to_catch_up(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    naps: list[float] = []
+    monkeypatch.setattr(srv, "_sleep", naps.append)
+    b = _board_with_tools()
+    b.client.lag = 2
+    try:
+        b.client.fa_ids = {p["player_id"] for p in b.season_available()[:1]}
+        b.season_board(refresh=True)
+        free = b.season_available()[0]
+        out = _tool("add_player", add=free["name"], apply=True)
+        assert out["applied"] is True and "note" not in out
+        assert len(naps) == 2  # two stale reads, then the change showed
+        # The cache holds the fresh roster, not the stale one.
+        assert free["player_id"] in {p["player_id"] for p in b.team_players(CFG.team_id)}
+    finally:
+        srv._board = None
+
+
+def test_writes_drop_the_cache_when_espn_never_catches_up(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    monkeypatch.setattr(srv, "_sleep", lambda s: None)
+    b = _board_with_tools()
+    rbs = sorted((p for p in b.team_players(CFG.team_id) if p["position"] == "RB"),
+                 key=lambda p: -p[WEEK_KEY])
+    b.client.slot_overrides = {rbs[0]["player_id"]: 20, rbs[-1]["player_id"]: 2}
+    b.league_rosters(refresh=True)
+    b.client.lag = 50
+    try:
+        out = _tool("set_lineup", apply=True)
+        assert out["applied"] is True
+        assert out["note"] == srv._LAG_NOTE
+        # Nothing stale is cached: once ESPN catches up, the next read is fresh.
+        assert WEEK not in b._rosters
+        b.client._lag_left = 0
+        assert _tool("set_lineup")["moves"] == []
     finally:
         srv._board = None
 

@@ -1023,10 +1023,12 @@ def set_lineup(week: int | None = None, apply: bool = False) -> dict:
         out["note"] = "Preview only. Call again with apply=true to submit these swaps."
         return out
     result = b.client.set_lineup(me, week, plan["moves"])
-    b.league_rosters(week, refresh=True)
+    synced = _after_write(b, week, _expect_slots(me, plan["moves"]))
     out["applied"] = True
     out["espn_status"] = result.get("status")
     out["transaction_id"] = result.get("id")
+    if not synced:
+        out["note"] = _LAG_NOTE
     return out
 
 
@@ -1067,7 +1069,7 @@ def move_player(player: str, to_slot: str, week: int | None = None) -> dict:
     if "error" in plan:
         return {"error": plan["error"]}
     result = b.client.set_lineup(me, week, plan["moves"])
-    b.league_rosters(week, refresh=True)
+    synced = _after_write(b, week, _expect_slots(me, plan["moves"]))
     out: dict[str, Any] = {
         "week": week,
         "applied": True,
@@ -1077,6 +1079,8 @@ def move_player(player: str, to_slot: str, week: int | None = None) -> dict:
     }
     if plan.get("displaced"):
         out["displaced"] = plan["displaced"]["name"]
+    if not synced:
+        out["note"] = _LAG_NOTE
     return out
 
 
@@ -1110,9 +1114,51 @@ def _swap_preview(res: dict, shape: LeagueShape, protect: str | None = None,
     return out
 
 
-def _after_write(b: DraftBoard, week: int) -> None:
-    """Rosters changed on ESPN; drop every cache that derives from them."""
-    b.league_rosters(week, refresh=True)
+# ESPN's reads lag its writes by a moment: a roster fetched right after a
+# transaction can still show the old state. Re-read until the change shows.
+_RETRY_DELAYS = (0.5, 1.0, 1.5, 2.0)
+
+
+def _sleep(seconds: float) -> None:
+    import time
+    time.sleep(seconds)
+
+
+def _after_write(b: DraftBoard, week: int, expect=None) -> bool:
+    """Refresh the roster cache after a write, waiting for ESPN to reflect it.
+
+    `expect(teams)` says whether the refreshed rosters show the change. Until
+    it does, re-read with a short back-off; if ESPN never catches up within
+    a few seconds, drop the cache so the next read fetches fresh, and return
+    False so the caller can say so.
+    """
+    for delay in (0.0, *_RETRY_DELAYS):
+        if delay:
+            _sleep(delay)
+        teams = b.league_rosters(week, refresh=True)
+        if expect is None or expect(teams):
+            return True
+    b.invalidate_rosters(week)
+    return False
+
+
+def _expect_slots(team_id: int, moves: list[dict]):
+    """Every moved player sits in his target slot."""
+    def check(teams: dict) -> bool:
+        entries = {e["player_id"]: e["slot_id"] for e in (teams.get(team_id) or {}).get("entries", [])}
+        return all(entries.get(m["player_id"]) == m["to_slot_id"] for m in moves)
+    return check
+
+
+def _expect_roster(team_id: int, present=(), absent=()):
+    """Added players are on the roster and dropped players are gone."""
+    def check(teams: dict) -> bool:
+        ids = {e["player_id"] for e in (teams.get(team_id) or {}).get("entries", [])}
+        return all(pid in ids for pid in present) and not any(pid in ids for pid in absent)
+    return check
+
+
+_LAG_NOTE = "ESPN accepted the change but its reads have not caught up yet; re-read in a moment."
 
 
 @mcp.tool()
@@ -1179,12 +1225,20 @@ def add_player(add: str, drop: str | None = None, apply: bool = False,
                                          [p["player_id"] for p in drops],
                                          waiver=waiver, bid=bid)
     result = b.client.post_transaction(body)
-    _after_write(b, week)
+    if waiver:
+        # Nothing moves until the waiver run; just drop the cache.
+        b.invalidate_rosters(week)
+        synced = True
+    else:
+        synced = _after_write(b, week, _expect_roster(
+            me, present=[target["player_id"]], absent=[p["player_id"] for p in drops]))
     out["applied"] = True
     out["espn_status"] = result.get("status")
     out["transaction_id"] = result.get("id")
     if waiver:
         out["note"] = "Claim queued; ESPN processes it at the next waiver run."
+    elif not synced:
+        out["note"] = _LAG_NOTE
     return out
 
 
@@ -1225,10 +1279,12 @@ def drop_player(player: str, apply: bool = False) -> dict:
         return out
     result = b.client.post_transaction(
         b.client.add_drop_transaction(me, week, [], [p["player_id"]]))
-    _after_write(b, week)
+    synced = _after_write(b, week, _expect_roster(me, absent=[p["player_id"]]))
     out["applied"] = True
     out["espn_status"] = result.get("status")
     out["transaction_id"] = result.get("id")
+    if not synced:
+        out["note"] = _LAG_NOTE
     return out
 
 
@@ -1387,7 +1443,7 @@ def respond_to_trade(trade_id: str, action: str, apply: bool = False) -> dict:
         return out
     result = b.client.post_transaction(
         b.client.trade_response_transaction(me, week, t, accept=(action == "accept")))
-    _after_write(b, week)
+    b.invalidate_rosters(week)  # an accepted trade may apply now or after review
     out["applied"] = True
     out["espn_status"] = result.get("status")
     out["transaction_id"] = result.get("id")
