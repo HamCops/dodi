@@ -214,3 +214,57 @@ def test_unexecuted_transaction_is_an_error():
             c.set_lineup(12, 3, [{"player_id": 1, "from_slot_id": 21, "to_slot_id": 20}])
     finally:
         c.close()
+
+
+def test_add_drop_transaction_shapes():
+    c = ESPNClient(CFG)
+    try:
+        fa = c.add_drop_transaction(12, 3, [111], [222])
+        assert fa["type"] == "FREEAGENT" and fa["executionType"] == "EXECUTE"
+        assert fa["items"] == [{"playerId": 111, "type": "ADD", "toTeamId": 12},
+                               {"playerId": 222, "type": "DROP", "fromTeamId": 12}]
+        w = c.add_drop_transaction(12, 3, [111], [], waiver=True, bid=5)
+        assert w["type"] == "WAIVER" and w["executionType"] == "PROCESS" and w["bidAmount"] == 5
+        assert w["items"] == [{"playerId": 111, "type": "ADD", "toTeamId": 12}]
+    finally:
+        c.close()
+
+
+def test_trade_transaction_shapes():
+    c = ESPNClient(CFG)
+    try:
+        prop = c.trade_proposal_transaction(12, 3, 10, [1, 2], [3])
+        assert prop["type"] == "TRADE_PROPOSAL" and prop["teamId"] == 12
+        assert prop["items"] == [
+            {"playerId": 1, "type": "TRADE", "fromTeamId": 12, "toTeamId": 10},
+            {"playerId": 2, "type": "TRADE", "fromTeamId": 12, "toTeamId": 10},
+            {"playerId": 3, "type": "TRADE", "fromTeamId": 10, "toTeamId": 12},
+        ]
+        prop["id"] = "abc-123"
+        acc = c.trade_response_transaction(10, 3, prop, accept=True)
+        assert acc["type"] == "TRADE_ACCEPT" and acc["relatedTransactionId"] == "abc-123"
+        assert acc["teamId"] == 10 and acc["items"] == prop["items"]
+        dec = c.trade_response_transaction(12, 3, prop, accept=False)
+        assert dec["type"] == "TRADE_DECLINE"
+    finally:
+        c.close()
+
+
+def test_pending_is_a_success_for_claims_and_offers():
+    class Pending(httpx.BaseTransport):
+        def __init__(self):
+            self.req = None
+
+        def handle_request(self, request):
+            self.req = request
+            return httpx.Response(200, json={"status": "PENDING", "id": "p1"})
+
+    c = ESPNClient(CFG)
+    t = Pending()
+    c._client._transport = t
+    try:
+        out = c.post_transaction(c.add_drop_transaction(12, 3, [1], [], waiver=True))
+    finally:
+        c.close()
+    assert out["status"] == "PENDING"
+    assert t.req.headers["x-fantasy-source"] == "kona"

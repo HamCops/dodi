@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from espn_mcp.board import DraftBoard  # noqa: E402
+from espn_mcp.espn import ESPNClient  # noqa: E402
 from espn_mcp.scoring import parse_settings  # noqa: E402
 from espn_mcp.season import (  # noqa: E402
     ROS_KEY,
@@ -349,7 +350,7 @@ class SeasonClient(FakeClient):
             e["waiverProcessDate"] = 1790000000000
         return e
 
-    def player_pool(self, week: int | None = None, **_: object) -> list[dict]:
+    def _base_player_pool(self, week: int | None = None) -> list[dict]:
         self.pool_calls += 1
         if not week:
             return build_pool()
@@ -377,6 +378,55 @@ class SeasonClient(FakeClient):
             })
         return {"teams": teams}
 
+    def player_pool(self, week: int | None = None, **_: object) -> list[dict]:
+        """The base pool marks every unrostered player WAIVERS; `fa_ids` are
+        the ones on the open market instead."""
+        out = []
+        for e in self._base_player_pool(week=week):
+            e = dict(e)
+            if e["id"] in self.owner:
+                e["status"], e["onTeamId"] = "ONTEAM", self.owner[e["id"]]
+            elif e["id"] in getattr(self, "fa_ids", ()):
+                e["status"] = "FREEAGENT"
+                e.pop("waiverProcessDate", None)
+            out.append(e)
+        return out
+
+    # The real request builders, over this fake's cfg.
+    cfg = CFG
+    _transaction = ESPNClient._transaction
+    add_drop_transaction = ESPNClient.add_drop_transaction
+    trade_proposal_transaction = ESPNClient.trade_proposal_transaction
+    trade_response_transaction = ESPNClient.trade_response_transaction
+
+    def post_transaction(self, body: dict) -> dict:
+        self.posts = getattr(self, "posts", [])
+        self.posts.append(body)
+        self.proposals = getattr(self, "proposals", [])
+        tid = body["teamId"]
+        by_id = {e["id"]: e for e in build_pool()}
+        n = len(self.posts)
+        if body["type"] in ("FREEAGENT", "WAIVER"):
+            for i in body["items"]:
+                if i["type"] == "DROP":
+                    self.drafted[tid] = [e for e in self.drafted[tid] if e["id"] != i["playerId"]]
+                    self.owner.pop(i["playerId"], None)
+                elif i["type"] == "ADD" and body["type"] == "FREEAGENT":
+                    self.drafted[tid].append(by_id[i["playerId"]])
+                    self.owner[i["playerId"]] = tid
+            status = "PENDING" if body["type"] == "WAIVER" else "EXECUTED"
+            return {"status": status, "id": f"tx-{n}"}
+        if body["type"] == "TRADE_PROPOSAL":
+            rec = {**body, "id": f"trade-{n}", "status": "PENDING", "proposedDate": 5_000_000}
+            self.proposals.append(rec)
+            return {"status": "PENDING", "id": rec["id"]}
+        if body["type"] in ("TRADE_ACCEPT", "TRADE_DECLINE"):
+            for rec in self.proposals:
+                if rec["id"] == body["relatedTransactionId"]:
+                    rec["status"] = "EXECUTED" if body["type"] == "TRADE_ACCEPT" else "DECLINED"
+            return {"status": "EXECUTED", "id": f"tx-{n}"}
+        raise AssertionError(body["type"])
+
     def set_lineup(self, team_id: int, week: int, moves: list[dict]) -> dict:
         self.writes = getattr(self, "writes", [])
         self.writes.append({"team_id": team_id, "week": week, "moves": moves})
@@ -389,7 +439,7 @@ class SeasonClient(FakeClient):
         """A draft pick, a lineup swap by team 1, and a waiver claim by team 2."""
         t1 = self.drafted[1]
         t2 = self.drafted[2]
-        return [
+        return list(getattr(self, "proposals", [])) + [
             {"id": "d1", "type": "DRAFT", "status": "EXECUTED", "teamId": 1,
              "scoringPeriodId": 0, "proposedDate": 1_000_000,
              "items": [{"type": "DRAFT", "playerId": t1[0]["id"], "fromLineupSlotId": -1,
@@ -608,6 +658,178 @@ def test_move_player_swaps_into_a_full_slot_and_writes_it(monkeypatch):
         assert "not on your roster" in nope["error"]
         slot = _tool("move_player", player=bench_wr["name"], to_slot="LB")
         assert "Unknown slot" in slot["error"]
+    finally:
+        srv._board = None
+
+
+def _board_with_tools():
+    import espn_mcp.server as srv
+
+    b = season_board()
+    srv._board = b
+    return b
+
+
+def test_add_player_previews_then_adds_a_free_agent_and_needs_a_drop_when_full(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = _board_with_tools()
+    try:
+        b.client.fa_ids = {p["player_id"] for p in b.season_available()[:3]}
+        b.season_board(refresh=True)
+        free = b.season_available()[0]
+        pre = _tool("add_player", add=free["name"])
+        assert pre["applied"] is False and pre["transaction"] == "free-agent add"
+        assert pre["must_drop"] == 0 and "error" not in pre
+        assert not hasattr(b.client, "posts")
+
+        done = _tool("add_player", add=free["name"], apply=True)
+        assert done["applied"] is True and done["espn_status"] == "EXECUTED"
+        body = b.client.posts[0]
+        assert body["type"] == "FREEAGENT"
+        assert body["items"] == [{"playerId": free["player_id"], "type": "ADD",
+                                  "toTeamId": CFG.team_id}]
+        mine = b.team_players(CFG.team_id)
+        assert len(mine) == 16 and free["player_id"] in {p["player_id"] for p in mine}
+
+        # Fill the last spot (limit is 17): the add after that needs a drop.
+        _tool("add_player", add=b.season_available()[0]["name"], apply=True)
+        assert len(b.team_players(CFG.team_id)) == 17
+        nxt = b.season_available()[0]
+        full = _tool("add_player", add=nxt["name"])
+        assert "name a player to drop" in full["error"]
+        assert full["suggested_drops"]
+        cut = full["suggested_drops"][0]["name"]
+        swap = _tool("add_player", add=nxt["name"], drop=cut, apply=True)
+        assert swap["applied"] is True
+        items = b.client.posts[2]["items"]
+        assert [i["type"] for i in items] == ["ADD", "DROP"]
+        assert len(b.team_players(CFG.team_id)) == 17
+
+        gone = _tool("add_player", add=free["name"])
+        assert "not on the free-agent pool" in gone["error"]
+    finally:
+        srv._board = None
+
+
+def test_add_player_files_a_waiver_claim_for_a_player_on_waivers(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = _board_with_tools()
+    try:
+        target = b.season_available()[1]
+        pre = _tool("add_player", add=target["name"])
+        assert pre["transaction"] == "waiver claim" and pre["waivers_clear"]
+        done = _tool("add_player", add=target["name"], apply=True)
+        body = b.client.posts[0]
+        assert body["type"] == "WAIVER" and body["executionType"] == "PROCESS"
+        assert done["espn_status"] == "PENDING" and "waiver run" in done["note"]
+    finally:
+        srv._board = None
+
+
+def test_drop_player_previews_then_drops(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = _board_with_tools()
+    try:
+        bench = next(p for p in b.team_players(CFG.team_id) if p["slot"] == "BE")
+        pre = _tool("drop_player", player=bench["name"])
+        assert pre["applied"] is False and pre["starts_now"] is False
+        assert pre["delta"]["starters_ros_per_game"] == 0
+        done = _tool("drop_player", player=bench["name"], apply=True)
+        assert done["applied"] is True
+        assert b.client.posts[0]["items"] == [
+            {"playerId": bench["player_id"], "type": "DROP", "fromTeamId": CFG.team_id}]
+        assert bench["player_id"] not in {p["player_id"] for p in b.team_players(CFG.team_id)}
+    finally:
+        srv._board = None
+
+
+def test_drop_and_add_refuse_a_locked_player():
+    # Real clock: every fixture kickoff is in the past, so everyone is locked.
+    mine = season_board().team_players(CFG.team_id)
+    assert "locked" in call("drop_player", player=mine[0]["name"])["error"]
+
+
+def test_propose_trade_previews_sends_lists_and_withdraws(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = _board_with_tools()
+    try:
+        partner = 2 if CFG.team_id != 2 else 3
+        mine = b.team_players(CFG.team_id)
+        theirs = b.team_players(partner)
+        give = next(p for p in mine if p["position"] == "RB")["name"]
+        get = next(p for p in theirs if p["position"] == "WR")["name"]
+
+        pre = _tool("propose_trade", give=[give], receive=[get])
+        assert pre["applied"] is False and pre["partner"]["team_id"] == partner
+        assert "summary" in pre and not hasattr(b.client, "posts")
+
+        sent = _tool("propose_trade", give=[give], receive=[get], apply=True)
+        assert sent["applied"] is True and sent["espn_status"] == "PENDING"
+        body = b.client.posts[0]
+        assert body["type"] == "TRADE_PROPOSAL"
+        assert {(i["fromTeamId"], i["toTeamId"]) for i in body["items"]} == {
+            (CFG.team_id, partner), (partner, CFG.team_id)}
+
+        pending = _tool("get_pending_trades")
+        assert pending["waiting_on_me"] == []
+        [row] = pending["waiting_on_them"]
+        assert row["trade_id"] == sent["transaction_id"] and row["proposed_by"] == "me"
+        assert [p["name"] for p in row["give"]] == [give]
+        assert [p["name"] for p in row["receive"]] == [get]
+        assert "my_starters_ros_per_game_change" in row["evaluation"]
+
+        nope = _tool("respond_to_trade", trade_id=row["trade_id"], action="accept")
+        assert "your own offer" in nope["error"]
+        pre = _tool("respond_to_trade", trade_id=row["trade_id"], action="withdraw")
+        assert pre["applied"] is False
+        done = _tool("respond_to_trade", trade_id=row["trade_id"], action="withdraw", apply=True)
+        assert done["applied"] is True
+        assert b.client.posts[-1]["type"] == "TRADE_DECLINE"
+        assert b.client.posts[-1]["relatedTransactionId"] == row["trade_id"]
+        assert _tool("get_pending_trades")["waiting_on_them"] == []
+    finally:
+        srv._board = None
+
+
+def test_respond_to_trade_accepts_an_offer_made_to_me(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = _board_with_tools()
+    try:
+        partner = 2 if CFG.team_id != 2 else 3
+        mine = b.team_players(CFG.team_id)
+        theirs = b.team_players(partner)
+        want = next(p for p in mine if p["position"] == "WR")
+        offer = next(p for p in theirs if p["position"] == "RB")
+        # They propose: their RB for my WR.
+        b.client.post_transaction(b.client.trade_proposal_transaction(
+            partner, WEEK, CFG.team_id, [offer["player_id"]], [want["player_id"]]))
+        b.client.posts.clear()
+
+        pending = _tool("get_pending_trades")
+        [row] = pending["waiting_on_me"]
+        assert row["proposed_by"] == "them"
+        assert [p["name"] for p in row["give"]] == [want["name"]]
+        assert [p["name"] for p in row["receive"]] == [offer["name"]]
+
+        bad = _tool("respond_to_trade", trade_id=row["trade_id"], action="withdraw")
+        assert "decline it instead" in bad["error"]
+        done = _tool("respond_to_trade", trade_id=row["trade_id"], action="accept", apply=True)
+        assert done["applied"] is True
+        assert b.client.posts[-1]["type"] == "TRADE_ACCEPT"
+        assert b.client.posts[-1]["teamId"] == CFG.team_id
+        assert _tool("get_pending_trades")["waiting_on_me"] == []
+        assert "No pending trade" in _tool("respond_to_trade", trade_id=row["trade_id"],
+                                           action="decline")["error"]
     finally:
         srv._board = None
 

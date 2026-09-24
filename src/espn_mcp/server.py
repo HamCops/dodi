@@ -26,6 +26,7 @@ from .season import (
     current_starters,
     describe_transaction,
     drop_candidates,
+    evaluate_swap,
     evaluate_trade,
     league_position_averages,
     lineup_changes,
@@ -50,7 +51,11 @@ mcp = MCPServer(
         "trades, with timestamps; rosters only show the present). CHANGING THE LINEUP: "
         "set_lineup previews the swaps to the best lineup by this week's projection "
         "and applies them with apply=true; move_player puts one named player in one "
-        "slot (e.g. IR to BE). Both are real ESPN roster changes. Rankings are by VORP (value over replacement), which already "
+        "slot (e.g. IR to BE). ROSTER MOVES: add_player (free agent or waiver claim, with "
+        "the drop), drop_player. TRADES: propose_trade sends an offer, get_pending_trades "
+        "lists offers waiting on either side, respond_to_trade accepts, declines or "
+        "withdraws one. Every writing tool previews by default and only touches ESPN "
+        "with apply=true; confirm with the user before applying. Rankings are by VORP (value over replacement), which already "
         "accounts for positional scarcity in this league's specific lineup; do not "
         "re-rank by raw projected points. In season, VORP is over rest-of-season "
         "points; week_proj is ESPN's single-week projection and already reflects "
@@ -1073,6 +1078,328 @@ def move_player(player: str, to_slot: str, week: int | None = None) -> dict:
     if plan.get("displaced"):
         out["displaced"] = plan["displaced"]["name"]
     return out
+
+
+def _my_context() -> tuple[DraftBoard, LeagueShape, int, int, list[dict]] | dict:
+    """(board, shape, my team id, week, my players), or an error dict."""
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = b.week()
+    return b, shape, me, week, b.team_players(me, week)
+
+
+def _swap_preview(res: dict, shape: LeagueShape, protect: str | None = None,
+                  incoming: list[dict] = ()) -> dict:
+    out = {
+        "before": res["before"],
+        "after": res["after"],
+        "delta": res["delta"],
+        "must_drop": res["must_drop"],
+        "violations": res["violations"],
+    }
+    if res["must_drop"]:
+        # Never suggest cutting the player being added.
+        new_ids = {p["player_id"] for p in incoming}
+        out["suggested_drops"] = [
+            _slim_season(p) for p in
+            drop_candidates(res["roster_after"], shape, res["must_drop"] + 3, protect)
+            if p["player_id"] not in new_ids][:res["must_drop"] + 2]
+    return out
+
+
+def _after_write(b: DraftBoard, week: int) -> None:
+    """Rosters changed on ESPN; drop every cache that derives from them."""
+    b.league_rosters(week, refresh=True)
+
+
+@mcp.tool()
+@handle_errors
+def add_player(add: str, drop: str | None = None, apply: bool = False,
+               bid: int | None = None) -> dict:
+    """Pick up a free agent, or claim a player on waivers, dropping someone.
+
+    A FREEAGENT add executes immediately; a WAIVERS claim is queued and
+    processed at the league's next waiver run (get_waiver_targets shows
+    `waivers_clear`). The drop goes in the same transaction so the roster
+    never sits over the limit. With apply=false (the default) nothing is
+    sent: the before/after lineup value, roster legality and suggested
+    drops come back for review.
+
+    Args:
+        add: name of the unrostered player, or a unique part of it.
+        drop: name of your player to cut. Required when the roster is full.
+        apply: submit to ESPN. False previews.
+        bid: FAAB bid for a waiver claim, in leagues that use a budget.
+    """
+    ctx = _my_context()
+    if isinstance(ctx, dict):
+        return ctx
+    b, shape, me, week, mine = ctx
+    pool = b.season_available(week)
+    found, problems = _resolve([add], pool, "the free-agent pool")
+    if problems:
+        return {"error": problems[0]["problem"], **problems[0],
+                "hint": "Only unrostered players can be added; check get_waiver_targets."}
+    target = found[0]
+    drops: list[dict] = []
+    if drop:
+        drops, more = _resolve([drop], mine, "your roster")
+        if more:
+            return {"error": more[0]["problem"], **more[0]}
+        if is_locked_now(drops[0]):
+            return {"error": f"{drops[0]['name']} is locked: his game has started."}
+    res = evaluate_swap(mine, drops, [target], shape)
+    waiver = target.get("roster_status") == "WAIVERS"
+    out: dict[str, Any] = {
+        "week": week,
+        "applied": False,
+        "add": _slim_season(target),
+        "drop": [_slim_season(p) for p in drops],
+        "transaction": "waiver claim" if waiver else "free-agent add",
+        **_swap_preview(res, shape, target["position"], incoming=[target]),
+    }
+    if waiver and target.get("waiver_clears_ms"):
+        out["waivers_clear"] = _local_time(target["waiver_clears_ms"], "%a %b %d %I:%M %p")
+    if shape.waivers.get("uses_faab"):
+        out["bid"] = bid or 0
+    if res["must_drop"]:
+        out["error"] = (f"Roster would be {res['must_drop']} over the limit; "
+                        "name a player to drop.")
+        return out
+    if res["violations"]:
+        out["error"] = "; ".join(res["violations"])
+        return out
+    if not apply:
+        out["note"] = "Preview only. Call again with apply=true to submit."
+        return out
+    body = b.client.add_drop_transaction(me, week, [target["player_id"]],
+                                         [p["player_id"] for p in drops],
+                                         waiver=waiver, bid=bid)
+    result = b.client.post_transaction(body)
+    _after_write(b, week)
+    out["applied"] = True
+    out["espn_status"] = result.get("status")
+    out["transaction_id"] = result.get("id")
+    if waiver:
+        out["note"] = "Claim queued; ESPN processes it at the next waiver run."
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def drop_player(player: str, apply: bool = False) -> dict:
+    """Drop one of your players to free a roster spot.
+
+    Previews what the lineup loses (usually nothing, if he was not
+    starting) and applies with apply=true. Prefer add_player with `drop`
+    when the spot is for a specific pickup: one transaction, no window
+    where the spot is empty.
+
+    Args:
+        player: name, or a unique part of it.
+        apply: submit to ESPN. False previews.
+    """
+    ctx = _my_context()
+    if isinstance(ctx, dict):
+        return ctx
+    b, shape, me, week, mine = ctx
+    found, problems = _resolve([player], mine, "your roster")
+    if problems:
+        return {"error": problems[0]["problem"], **problems[0]}
+    p = found[0]
+    if is_locked_now(p):
+        return {"error": f"{p['name']} is locked: his game has started."}
+    res = evaluate_swap(mine, [p], [], shape)
+    out: dict[str, Any] = {
+        "week": week,
+        "applied": False,
+        "drop": _slim_season(p),
+        **_swap_preview(res, shape),
+        "starts_now": p.get("slot_id") not in (20, 21),
+    }
+    if not apply:
+        out["note"] = "Preview only. Call again with apply=true to submit."
+        return out
+    result = b.client.post_transaction(
+        b.client.add_drop_transaction(me, week, [], [p["player_id"]]))
+    _after_write(b, week)
+    out["applied"] = True
+    out["espn_status"] = result.get("status")
+    out["transaction_id"] = result.get("id")
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def propose_trade(give: list[str], receive: list[str],
+                  partner_team_id: int | None = None, apply: bool = False) -> dict:
+    """Send a trade offer to another team, or preview it first.
+
+    The preview is analyze_trade: both sides before and after. With
+    apply=true the offer is posted to ESPN and the other manager is
+    notified; it then waits on them (see get_pending_trades; withdraw it
+    with respond_to_trade). Sending an offer is a message to a real person,
+    so confirm with the user before applying.
+
+    Args:
+        give: names of players you send.
+        receive: names of players you get.
+        partner_team_id: the other team. Inferred from `receive` if omitted.
+        apply: post the offer. False previews.
+    """
+    ev = analyze_trade(give, receive, partner_team_id)
+    if "error" in ev:
+        return ev
+    ev["applied"] = False
+    if ev.get("trade_deadline_passed"):
+        ev["error"] = "The trade deadline has passed."
+        return ev
+    for side in ("me", "them"):
+        if ev[side]["violations"]:
+            ev["error"] = f"{side}: " + "; ".join(ev[side]["violations"])
+            return ev
+    if not apply:
+        ev["note"] = "Preview only. Call again with apply=true to send the offer."
+        return ev
+    b = board()
+    me = _require_team(b)
+    week = b.week()
+    body = b.client.trade_proposal_transaction(
+        me, week, ev["partner"]["team_id"],
+        [p["id"] for p in ev["give"]], [p["id"] for p in ev["receive"]])
+    result = b.client.post_transaction(body)
+    ev["applied"] = True
+    ev["espn_status"] = result.get("status")
+    ev["transaction_id"] = result.get("id")
+    ev["note"] = "Offer sent. It waits on the other manager; get_pending_trades tracks it."
+    return ev
+
+
+PENDING_TRADE_STATUSES = {"PENDING", "PROPOSED"}
+
+
+def _pending_proposals(b: DraftBoard, me: int) -> list[dict]:
+    out = []
+    for t in b.client.transactions():
+        if t.get("type") != "TRADE_PROPOSAL" or t.get("status") not in PENDING_TRADE_STATUSES:
+            continue
+        teams = {int(i.get("fromTeamId") or 0) for i in t.get("items") or []}
+        teams |= {int(i.get("toTeamId") or 0) for i in t.get("items") or []}
+        if me in teams:
+            out.append(t)
+    return out
+
+
+def _describe_proposal(b: DraftBoard, t: dict, me: int, week: int) -> dict:
+    shape = b.shape()
+    teams = b.league_rosters(week)
+    items = [i for i in t.get("items") or [] if i.get("type") == "TRADE"]
+    partner = next((int(i["toTeamId"]) for i in items if int(i["fromTeamId"]) == me), None)
+    if partner is None:
+        partner = next((int(i["fromTeamId"]) for i in items if int(i["toTeamId"]) == me), None)
+    mine = b.team_players(me, week)
+    theirs = b.team_players(partner, week) if partner else []
+    by_id = {p["player_id"]: p for p in mine + theirs}
+    give_ids = [int(i["playerId"]) for i in items if int(i["fromTeamId"]) == me]
+    recv_ids = [int(i["playerId"]) for i in items if int(i["toTeamId"]) == me]
+    give = [by_id[i] for i in give_ids if i in by_id]
+    receive = [by_id[i] for i in recv_ids if i in by_id]
+    out: dict[str, Any] = {
+        "trade_id": t.get("id"),
+        "status": t.get("status"),
+        "proposed_by": "me" if int(t.get("teamId") or 0) == me else "them",
+        "partner": _team_brief(teams[partner]) if partner in teams else {"team_id": partner},
+        "proposed": _local_time(t.get("proposedDate"), "%a %b %d %I:%M %p"),
+        "give": [_slim_season(p) for p in give],
+        "receive": [_slim_season(p) for p in receive],
+    }
+    if len(give) == len(give_ids) and len(receive) == len(recv_ids) and theirs:
+        ev = evaluate_trade(mine, theirs, give, receive, shape)
+        out["evaluation"] = {
+            "my_starters_ros_per_game_change": ev["me"]["delta"]["starters_ros_per_game"],
+            "their_starters_ros_per_game_change": ev["them"]["delta"]["starters_ros_per_game"],
+            "my_this_week_change": ev["me"]["delta"]["starters_this_week"],
+            "my_must_drop": ev["me"]["must_drop"],
+            "my_violations": ev["me"]["violations"],
+        }
+    else:
+        out["note"] = "Some players in this offer are no longer on either roster."
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def get_pending_trades() -> dict:
+    """Trade offers waiting on you, and offers you sent that are waiting on them.
+
+    Each with its id (for respond_to_trade), who proposed it, both sides
+    from your point of view, and the same lineup evaluation analyze_trade
+    gives.
+    """
+    ctx = _my_context()
+    if isinstance(ctx, dict):
+        return ctx
+    b, shape, me, week, _ = ctx
+    rows = [_describe_proposal(b, t, me, week) for t in _pending_proposals(b, me)]
+    return {
+        "week": week,
+        "waiting_on_me": [r for r in rows if r["proposed_by"] == "them"],
+        "waiting_on_them": [r for r in rows if r["proposed_by"] == "me"],
+    }
+
+
+@mcp.tool()
+@handle_errors
+def respond_to_trade(trade_id: str, action: str, apply: bool = False) -> dict:
+    """Accept or decline an offer made to you, or withdraw one you sent.
+
+    Args:
+        trade_id: from get_pending_trades.
+        action: "accept", "decline" or "withdraw" (your own offer).
+        apply: submit to ESPN. False previews the offer and the action.
+    """
+    ctx = _my_context()
+    if isinstance(ctx, dict):
+        return ctx
+    b, shape, me, week, _ = ctx
+    action = action.strip().lower()
+    if action not in ("accept", "decline", "withdraw", "cancel"):
+        return {"error": "action must be accept, decline or withdraw."}
+    t = next((t for t in _pending_proposals(b, me) if str(t.get("id")) == str(trade_id)), None)
+    if t is None:
+        return {"error": f"No pending trade {trade_id!r} involving your team.",
+                "hint": "get_pending_trades lists the current ones."}
+    desc = _describe_proposal(b, t, me, week)
+    own = desc["proposed_by"] == "me"
+    if action == "accept" and own:
+        return {"error": "This is your own offer; it waits on the other manager.", **desc}
+    if action in ("withdraw", "cancel") and not own:
+        return {"error": "This offer was made to you; decline it instead.", **desc}
+    if action == "accept" and desc.get("evaluation", {}).get("my_violations"):
+        return {"error": "Accepting would break your roster limits: "
+                         + "; ".join(desc["evaluation"]["my_violations"]), **desc}
+    out: dict[str, Any] = {"action": action, "applied": False, **desc}
+    if not apply:
+        out["note"] = f"Preview only. Call again with apply=true to {action}."
+        return out
+    result = b.client.post_transaction(
+        b.client.trade_response_transaction(me, week, t, accept=(action == "accept")))
+    _after_write(b, week)
+    out["applied"] = True
+    out["espn_status"] = result.get("status")
+    out["transaction_id"] = result.get("id")
+    if action == "accept":
+        out["note"] = ("Accepted. ESPN applies it now, or after the league's review "
+                       "period if one is set.")
+    return out
+
+
+def is_locked_now(p: dict) -> bool:
+    from .season import is_locked
+    return is_locked(p, _now_ms())
 
 
 @mcp.tool()

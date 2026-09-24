@@ -107,6 +107,11 @@ In season:
 | `get_roster` | In season: a team's starters and bench with lineup slots, this week's and rest-of-season projections, positional strength. |
 | `set_lineup` | **Writes to ESPN.** The swaps that turn your set lineup into the best one by this week's projection. Default is a preview; `apply=true` submits them as one ESPN transaction. Players whose game has kicked off are locked and worked around; IR is left alone. |
 | `move_player` | **Writes to ESPN.** Put one named player in one slot (`QB`, `RB`, `WR`, `TE`, `FLEX`, `K`, `D/ST`, `BE`, `IR`). A full starting slot swaps out its lowest-projected occupant. The way to activate a player off IR once a bench spot is free. |
+| `add_player` | **Writes to ESPN.** Free-agent pickup (immediate) or waiver claim (queued for the next run), with the drop in the same transaction. Preview shows the lineup before/after, roster legality and suggested drops; `apply=true` submits. |
+| `drop_player` | **Writes to ESPN.** Cut one player. Preview shows what the lineup loses. |
+| `propose_trade` | **Writes to ESPN.** Preview is `analyze_trade`; `apply=true` sends the offer to the other manager. |
+| `get_pending_trades` | Offers waiting on you and offers you sent, with ids and the same evaluation `analyze_trade` gives. |
+| `respond_to_trade` | **Writes to ESPN.** Accept or decline an offer made to you, or withdraw one you sent. |
 
 The player pool is cached for `ESPN_POOL_TTL` seconds (default 15 min) because
 it is slow and changes slowly. Draft picks are never cached; rosters are cached
@@ -215,11 +220,24 @@ Typical asks:
 - "Bowers is off IR, put him on the bench" → `move_player("Bowers", "BE")`.
   Needs a free bench spot first; ESPN will not do the drop for you.
 
-Both writing tools need `ESPN_S2` and `SWID`; they post to
-`lm-api-writes.fantasy.espn.com` with the same cookie scoping as reads. A
+- "Grab the Saints defense, drop Shakir" → `add_player("Saints", drop="Shakir")`
+  to preview, then `apply=true`. A player on waivers becomes a claim that
+  processes at `waivers_clear`; a free agent lands immediately.
+- "Offer him Judkins for Pickens" → `propose_trade(["Judkins"], ["Pickens"])`
+  previews both sides; `apply=true` sends it. `get_pending_trades` tracks it;
+  `respond_to_trade(id, "withdraw")` pulls it back.
+- "Anyone offered me anything?" → `get_pending_trades`, then
+  `respond_to_trade(id, "accept" | "decline")`.
+
+Every writing tool needs `ESPN_S2` and `SWID`; they post to
+`lm-api-writes.fantasy.espn.com` with the same cookie scoping as reads, and
+every one previews by default and only touches ESPN with `apply=true`. A
 player is locked from his kickoff until the week ends, and ESPN rejects a
-transaction that touches one, so both tools plan around locked players rather
-than submit and fail.
+transaction that touches one, so the tools plan around locked players rather
+than submit and fail. Lineup moves and free-agent adds have been exercised
+against a live league; the waiver, trade-proposal and trade-response payloads
+follow the shapes ESPN's own client sends and are covered by tests, but the
+first real use of each is its live check.
 
 `opp_rank_vs_pos` is ESPN's OPRK — points a defense allows to a position, 1 =
 softest matchup, 32 = stingiest. It is empty until games have been played, so

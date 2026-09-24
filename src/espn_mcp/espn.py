@@ -134,12 +134,17 @@ class ESPNClient:
 
     # --- Writes -----------------------------------------------------------
 
+    # What ESPN reports for a write that went through. A lineup move or a
+    # free-agent add executes at once; a waiver claim and a trade proposal
+    # are accepted as pending and resolved later.
+    OK_STATUSES = ("EXECUTED", "PENDING", "PROPOSED")
+
     def post_transaction(self, body: dict) -> dict:
-        """Submit one roster transaction for this league and return ESPN's record.
+        """Submit one transaction for this league and return ESPN's record.
 
         Needs the login cookies: ESPN has no anonymous writes. The body is
         the v3 transaction shape (type, teamId, memberId, items[]); callers
-        build it with `lineup_transaction`.
+        build it with the *_transaction helpers below.
         """
         if not self.cfg.has_auth:
             raise ESPNError(
@@ -147,11 +152,61 @@ class ESPNClient:
                 "without them."
             )
         resp = self._send("POST", f"{self._league_write_url}/transactions/", json=body,
-                          headers={"Content-Type": "application/json"})
+                          headers={"Content-Type": "application/json",
+                                   "X-Fantasy-Source": "kona"})
         data = self._check(resp)
-        if isinstance(data, dict) and data.get("status") not in (None, "EXECUTED"):
+        if isinstance(data, dict) and data.get("status") not in (None, *self.OK_STATUSES):
             raise ESPNError(f"ESPN did not execute the transaction: {data.get('status')}")
         return data
+
+    def _transaction(self, kind: str, team_id: int, week: int, items: list[dict],
+                     execution: str = "EXECUTE", **extra: Any) -> dict:
+        return {
+            "isLeagueManager": False,
+            "teamId": int(team_id),
+            "type": kind,
+            "memberId": self.cfg.swid,
+            "scoringPeriodId": int(week),
+            "executionType": execution,
+            "items": items,
+            **extra,
+        }
+
+    def add_drop_transaction(self, team_id: int, week: int, add_ids: list[int],
+                             drop_ids: list[int], waiver: bool = False,
+                             bid: int | None = None) -> dict:
+        """A free-agent pickup (executes now) or a waiver claim (processes at
+        the next run), with any drops in the same transaction so the roster
+        never goes over the limit in between."""
+        items = [{"playerId": int(pid), "type": "ADD", "toTeamId": int(team_id)}
+                 for pid in add_ids]
+        items += [{"playerId": int(pid), "type": "DROP", "fromTeamId": int(team_id)}
+                  for pid in drop_ids]
+        if waiver:
+            return self._transaction("WAIVER", team_id, week, items, execution="PROCESS",
+                                     bidAmount=int(bid or 0))
+        return self._transaction("FREEAGENT", team_id, week, items)
+
+    def trade_proposal_transaction(self, team_id: int, week: int, partner_id: int,
+                                   give_ids: list[int], receive_ids: list[int]) -> dict:
+        items = [{"playerId": int(pid), "type": "TRADE",
+                  "fromTeamId": int(team_id), "toTeamId": int(partner_id)}
+                 for pid in give_ids]
+        items += [{"playerId": int(pid), "type": "TRADE",
+                   "fromTeamId": int(partner_id), "toTeamId": int(team_id)}
+                  for pid in receive_ids]
+        return self._transaction("TRADE_PROPOSAL", team_id, week, items)
+
+    def trade_response_transaction(self, team_id: int, week: int, proposal: dict,
+                                   accept: bool) -> dict:
+        """Accept or decline a pending proposal. A proposer declining his own
+        proposal is how ESPN withdraws it."""
+        items = [{"playerId": int(i["playerId"]), "type": "TRADE",
+                  "fromTeamId": int(i["fromTeamId"]), "toTeamId": int(i["toTeamId"])}
+                 for i in proposal.get("items") or [] if i.get("type") == "TRADE"]
+        return self._transaction("TRADE_ACCEPT" if accept else "TRADE_DECLINE",
+                                 team_id, week, items,
+                                 relatedTransactionId=proposal["id"])
 
     def lineup_transaction(self, team_id: int, week: int, moves: list[dict]) -> dict:
         """A ROSTER transaction moving each player in `moves` between slots.
