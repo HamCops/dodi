@@ -270,7 +270,3 @@ scripts/
   grade_external.py      grade rosters against an outside ranking
 state/                   picks, browser profile, notes (gitignored)
 ```
-
-The Omarchy desktop widget that shows this matchup in the bar is a separate
-project, [omarchy-fantasy-feed](https://github.com/HamCops/omarchy-fantasy-feed);
-it reads the league on its own and shares no code with this one.
