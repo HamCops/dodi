@@ -1,7 +1,7 @@
 [project]
 name = "espn-mcp"
 version = "0.1.0"
-description = "MCP server exposing an ESPN fantasy football league for AI-assisted snake drafting"
+description = "MCP server for an ESPN fantasy football league: draft, weekly lineups, waivers, trades, and the roster moves themselves"
 requires-python = ">=3.11"
 license = "MIT"
 readme = "README.md"
