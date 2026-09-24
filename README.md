@@ -105,6 +105,8 @@ In season:
 | `get_transactions` | The league's transaction log, newest first: every lineup move (player, from slot, to slot), add, drop, waiver claim and trade, with team and timestamp. Filter by team, week or kind. The only view of history; rosters show the present. |
 | `find_trade_partners` | Which teams are weak where you are strong and vice versa, with their tradeable players, your surplus, each team's trade block, and the best 1-for-1 that helps both sides. |
 | `get_roster` | In season: a team's starters and bench with lineup slots, this week's and rest-of-season projections, positional strength. |
+| `set_lineup` | **Writes to ESPN.** The swaps that turn your set lineup into the best one by this week's projection. Default is a preview; `apply=true` submits them as one ESPN transaction. Players whose game has kicked off are locked and worked around; IR is left alone. |
+| `move_player` | **Writes to ESPN.** Put one named player in one slot (`QB`, `RB`, `WR`, `TE`, `FLEX`, `K`, `D/ST`, `BE`, `IR`). A full starting slot swaps out its lowest-projected occupant. The way to activate a player off IR once a bench spot is free. |
 
 The player pool is cached for `ESPN_POOL_TTL` seconds (default 15 min) because
 it is slow and changes slowly. Draft picks are never cached; rosters are cached
@@ -206,6 +208,18 @@ Typical asks:
   position. `best_1_for_1` is a concrete opener that helps both lineups;
   `mutual: false` means every fit found is lopsided.
 - "Next week I have three guys on bye" → `get_matchup(week=N)`.
+- "Set my best lineup" → `set_lineup`, then `set_lineup(apply=true)` once the
+  preview looks right. It uses the same projection `get_matchup` scores, so
+  the swaps match. A tiny `gain` (a few hundredths) is projection noise, not a
+  reason to bench a Sunday player for a Thursday one.
+- "Bowers is off IR, put him on the bench" → `move_player("Bowers", "BE")`.
+  Needs a free bench spot first; ESPN will not do the drop for you.
+
+Both writing tools need `ESPN_S2` and `SWID`; they post to
+`lm-api-writes.fantasy.espn.com` with the same cookie scoping as reads. A
+player is locked from his kickoff until the week ends, and ESPN rejects a
+transaction that touches one, so both tools plan around locked players rather
+than submit and fail.
 
 `opp_rank_vs_pos` is ESPN's OPRK — points a defense allows to a position, 1 =
 softest matchup, 32 = stingiest. It is empty until games have been played, so

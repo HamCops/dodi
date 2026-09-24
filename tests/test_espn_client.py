@@ -149,3 +149,68 @@ def test_scrub_covers_truncated_bodies_and_the_exception_cause():
             assert "***" in formatted
         finally:
             c.close()
+
+
+class _Recorder(httpx.BaseTransport):
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(200, json={"status": "EXECUTED", "id": "abc"})
+
+
+def test_set_lineup_posts_to_the_writes_host_with_cookies():
+    c = ESPNClient(CFG)
+    rec = _Recorder()
+    c._client._transport = rec
+    try:
+        out = c.set_lineup(12, 3, [{"player_id": 1, "from_slot_id": 21, "to_slot_id": 20}])
+    finally:
+        c.close()
+    assert out["status"] == "EXECUTED"
+    req = rec.requests[0]
+    assert req.method == "POST"
+    assert req.url.host == "lm-api-writes.fantasy.espn.com"
+    assert "espn_s2=secret-s2" in req.headers.get("cookie", "")
+    import json
+    body = json.loads(req.content)
+    assert body["type"] == "ROSTER" and body["teamId"] == 12 and body["scoringPeriodId"] == 3
+    assert body["memberId"] == CFG.swid
+    assert body["items"] == [{"playerId": 1, "type": "LINEUP",
+                              "fromLineupSlotId": 21, "toLineupSlotId": 20}]
+
+
+def test_set_lineup_with_no_moves_does_not_call_espn():
+    c = ESPNClient(CFG)
+    rec = _Recorder()
+    c._client._transport = rec
+    try:
+        assert c.set_lineup(12, 3, [])["status"] == "NOOP"
+    finally:
+        c.close()
+    assert rec.requests == []
+
+
+def test_writes_refused_without_auth():
+    c = ESPNClient(Config(league_id="1", season=2026, team_id=None, espn_s2=None,
+                          swid=None, pool_ttl=900, state_dir=None))
+    try:
+        with pytest.raises(ESPNError, match="ESPN_S2 and SWID"):
+            c.set_lineup(12, 3, [{"player_id": 1, "from_slot_id": 21, "to_slot_id": 20}])
+    finally:
+        c.close()
+
+
+def test_unexecuted_transaction_is_an_error():
+    class Refuse(httpx.BaseTransport):
+        def handle_request(self, request):
+            return httpx.Response(200, json={"status": "INVALID"})
+
+    c = ESPNClient(CFG)
+    c._client._transport = Refuse()
+    try:
+        with pytest.raises(ESPNError, match="INVALID"):
+            c.set_lineup(12, 3, [{"player_id": 1, "from_slot_id": 21, "to_slot_id": 20}])
+    finally:
+        c.close()

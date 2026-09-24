@@ -26,6 +26,8 @@ from espn_mcp.season import (  # noqa: E402
     evaluate_trade,
     lineup_changes,
     optimal_lineup,
+    plan_lineup,
+    plan_move,
     roster_profile,
     roster_violations,
     starting_slots,
@@ -177,6 +179,85 @@ def test_evaluate_trade_reports_both_sides_and_roster_limits():
     assert "must drop 1" in ev["them"]["violations"][0]
 
 
+def test_plan_lineup_moves_the_better_bench_player_in_and_the_starter_out():
+    shape = make_shape()
+    ps = [
+        player("QB1", "QB", 20, slot_id=0),
+        player("RB1", "RB", 15, slot_id=2), player("RB2", "RB", 12, slot_id=2),
+        player("WR1", "WR", 11, slot_id=4), player("WR2", "WR", 6, slot_id=4),
+        player("WR3", "WR", 9, slot_id=20),  # better than WR2, on the bench
+        player("TE1", "TE", 8, slot_id=6),
+        player("RB3", "RB", 10, slot_id=23),
+        player("K", "K", 7, slot_id=17), player("D", "D/ST", 6, slot_id=16),
+        player("IR guy", "WR", 30, slot_id=21),  # would start, but IR stays IR
+    ]
+    plan = plan_lineup(ps, shape, WEEK_KEY)
+    moves = {(m["name"], m["from_slot"], m["to_slot"]) for m in plan["moves"]}
+    assert moves == {("WR3", "BE", "WR"), ("WR2", "WR", "BE")}
+    assert plan["gain"] == 3
+    assert plan["unfilled"] == []
+    assert "IR guy" not in {p["name"] for _, p in plan["starters"]}
+
+
+def test_plan_lineup_keeps_locked_players_where_they_are():
+    shape = make_shape()
+    ps = [
+        player("QB1", "QB", 20, slot_id=0),
+        player("RB1", "RB", 15, slot_id=2), player("RB2", "RB", 12, slot_id=2),
+        player("WR1", "WR", 11, slot_id=4),
+        player("WR2", "WR", 6, slot_id=4, kickoff_ms=100),   # game started
+        player("WR3", "WR", 9, slot_id=20, kickoff_ms=100),  # also started, on bench
+        player("WR4", "WR", 8, slot_id=20, kickoff_ms=900),  # not yet
+        player("TE1", "TE", 8, slot_id=6),
+        player("RB3", "RB", 10, slot_id=23),
+        player("K", "K", 7, slot_id=17), player("D", "D/ST", 6, slot_id=16),
+    ]
+    plan = plan_lineup(ps, shape, WEEK_KEY, now_ms=500)
+    assert {p["name"] for p in plan["locked"]} == {"WR2", "WR3"}
+    assert plan["moves"] == []  # WR2 is locked in; WR3 locked out
+    assert plan["gain"] == 0
+    # Once nothing is locked, WR3 should replace WR2.
+    assert {m["name"] for m in plan_lineup(ps, shape, WEEK_KEY, now_ms=50)["moves"]} == {"WR2", "WR3"}
+
+
+def test_plan_lineup_reports_slots_nobody_can_fill():
+    shape = make_shape()
+    ps = [player("QB1", "QB", 20, slot_id=0), player("RB1", "RB", 15, slot_id=2)]
+    plan = plan_lineup(ps, shape, WEEK_KEY)
+    assert "K" in plan["unfilled"] and "D/ST" in plan["unfilled"]
+    assert plan["moves"] == []
+
+
+def test_plan_move_swaps_out_the_weakest_occupant_of_a_full_slot():
+    shape = make_shape()
+    wr1 = player("WR1", "WR", 11, slot_id=4, eligible_slots=["WR", "FLEX", "BE"])
+    wr2 = player("WR2", "WR", 6, slot_id=4, eligible_slots=["WR", "FLEX", "BE"])
+    wr3 = player("WR3", "WR", 9, slot_id=20, eligible_slots=["WR", "FLEX", "BE"])
+    plan = plan_move([wr1, wr2, wr3], shape, wr3, 4, WEEK_KEY)
+    assert plan["displaced"]["name"] == "WR2"
+    assert [(m["name"], m["to_slot"]) for m in plan["moves"]] == [("WR3", "WR"), ("WR2", "BE")]
+    # Flex -> WR: the displaced WR takes the vacated flex slot.
+    wr3["slot_id"] = 23
+    plan = plan_move([wr1, wr2, wr3], shape, wr3, 4, WEEK_KEY)
+    assert [(m["name"], m["to_slot"]) for m in plan["moves"]] == [("WR3", "WR"), ("WR2", "FLEX")]
+
+
+def test_plan_move_refuses_illegal_moves():
+    shape = make_shape()
+    te = player("TE1", "TE", 8, slot_id=20, eligible_slots=["TE", "FLEX", "BE"],
+                injury_status="ACTIVE")
+    assert "not eligible" in plan_move([te], shape, te, 0, WEEK_KEY)["error"]  # TE -> QB
+    assert "already" in plan_move([te], shape, te, 20, WEEK_KEY)["error"]
+    assert "IR" in plan_move([te], shape, te, 21, WEEK_KEY)["error"]  # healthy -> IR
+    te["kickoff_ms"] = 1
+    assert "locked" in plan_move([te], shape, te, 6, WEEK_KEY, now_ms=2)["error"]
+    # IR -> bench with the bench full.
+    ir = player("IR guy", "WR", 9, slot_id=21, eligible_slots=["WR", "FLEX", "BE", "IR"])
+    bench = [player(f"B{i}", "WR", 1, slot_id=20) for i in range(shape.lineup_slots[20])]
+    assert "bench is full" in plan_move(bench + [ir], shape, ir, 20, WEEK_KEY)["error"]
+    assert plan_move(bench[:-1] + [ir], shape, ir, 20, WEEK_KEY)["moves"][0]["to_slot"] == "BE"
+
+
 def test_position_limits_are_enforced():
     shape = make_shape()
     object.__setattr__(shape, "position_limits", {"RB": 3})
@@ -287,12 +368,22 @@ class SeasonClient(FakeClient):
                 "transactionCounter": {"acquisitionBudgetSpent": 0},
                 "tradeBlock": {"players": {str(entries[3]["id"]): "ON_THE_BLOCK"}} if t == 4 else {},
                 "roster": {"entries": [
-                    {"playerId": e["id"], "lineupSlotId": slot, "acquisitionType": "DRAFT",
+                    {"playerId": e["id"],
+                     "lineupSlotId": getattr(self, "slot_overrides", {}).get(e["id"], slot),
+                     "acquisitionType": "DRAFT",
                      "playerPoolEntry": self._with_week(e, week)}
                     for e, slot in zip(entries, slots)
                 ]},
             })
         return {"teams": teams}
+
+    def set_lineup(self, team_id: int, week: int, moves: list[dict]) -> dict:
+        self.writes = getattr(self, "writes", [])
+        self.writes.append({"team_id": team_id, "week": week, "moves": moves})
+        overrides = self.slot_overrides = getattr(self, "slot_overrides", {})
+        for m in moves:
+            overrides[int(m["player_id"])] = int(m["to_slot_id"])
+        return {"status": "EXECUTED", "id": f"tx-{len(self.writes)}"}
 
     def transactions(self) -> list[dict]:
         """A draft pick, a lineup swap by team 1, and a waiver claim by team 2."""
@@ -424,6 +515,101 @@ def test_get_matchup_flags_bye_holes():
     assert out["my_lineup"]["holes"]
     assert all(h["why"] == "bye" for h in out["my_lineup"]["holes"])
     assert out["my_lineup"]["optimal_total"] == 0
+
+
+def _unlock(monkeypatch):
+    """Fixture kickoffs are in the past; pretend it is before them."""
+    import espn_mcp.server as srv
+    monkeypatch.setattr(srv, "_now_ms", lambda: 0)
+
+
+def _tool(name: str, **kw):
+    """`call` without swapping the board, so writes persist across calls."""
+    import espn_mcp.server as srv
+
+    result = asyncio.run(srv.mcp.call_tool(name, kw))
+    data = getattr(result, "structured_content", None)
+    if data is None:
+        import json
+
+        data = json.loads(result.content[0].text)
+    return data
+
+
+def test_set_lineup_previews_then_applies_the_matchup_swaps(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = season_board()
+    srv._board = b
+    # The fixture lineup starts optimal: bench the best RB and start the worst.
+    rbs = sorted((p for p in b.team_players(CFG.team_id) if p["position"] == "RB"),
+                 key=lambda p: -p[WEEK_KEY])
+    b.client.slot_overrides = {rbs[0]["player_id"]: 20, rbs[-1]["player_id"]: 2}
+    b.league_rosters(refresh=True)
+    try:
+        matchup = _tool("get_matchup")
+        assert matchup["my_lineup"]["gain_from_optimal"] > 0
+        preview = _tool("set_lineup")
+        assert preview["applied"] is False
+        assert preview["gain"] == pytest.approx(matchup["my_lineup"]["gain_from_optimal"], abs=0.01)
+        assert {m["player"] for m in preview["moves"]} >= {
+            p["name"] for p in matchup["my_lineup"]["start"] + matchup["my_lineup"]["sit"]}
+        assert len(preview["starters_after"]) == 9
+        # Slots are the planned ones, not where the player sits now.
+        assert {s["slot"] for s in preview["starters_after"]} == {
+            "QB", "RB", "WR", "TE", "FLEX", "K", "D/ST"}
+        assert not hasattr(b.client, "writes")
+
+        done = _tool("set_lineup", apply=True)
+        assert done["applied"] is True and done["espn_status"] == "EXECUTED"
+        assert b.client.writes[0]["team_id"] == CFG.team_id
+        assert b.client.writes[0]["week"] == WEEK
+        assert {m["player_id"] for m in b.client.writes[0]["moves"]} == {
+            p["id"] for p in matchup["my_lineup"]["start"] + matchup["my_lineup"]["sit"]}
+
+        # The roster cache was refreshed: the lineup is now optimal.
+        again = _tool("set_lineup", apply=True)
+        assert again["moves"] == [] and again["applied"] is False
+        assert len(b.client.writes) == 1
+        after = _tool("get_matchup")
+        assert after["my_lineup"]["gain_from_optimal"] == 0
+    finally:
+        srv._board = None
+
+
+def test_set_lineup_locks_players_whose_game_started():
+    # Fixture kickoffs are in the past relative to the real clock.
+    out = call("set_lineup")
+    assert out["locked"]
+    assert out["moves"] == []
+
+
+def test_move_player_swaps_into_a_full_slot_and_writes_it(monkeypatch):
+    _unlock(monkeypatch)
+    import espn_mcp.server as srv
+
+    b = season_board()
+    srv._board = b
+    try:
+        mine = b.team_players(CFG.team_id)
+        bench_wr = next(p for p in mine if p["position"] == "WR" and p["slot"] == "BE")
+        out = _tool("move_player", player=bench_wr["name"], to_slot="wr")
+        assert out["applied"] is True
+        assert out["moves"][0] == {"player": bench_wr["name"], "from": "BE", "to": "WR"}
+        assert out["displaced"] and out["moves"][1]["from"] == "WR"
+        assert b.client.writes[0]["moves"][0]["to_slot_id"] == 4
+        assert next(p for p in b.team_players(CFG.team_id)
+                    if p["player_id"] == bench_wr["player_id"])["slot"] == "WR"
+
+        bad = _tool("move_player", player=bench_wr["name"], to_slot="QB")
+        assert "not eligible" in bad["error"]
+        nope = _tool("move_player", player="Nobody Real", to_slot="BE")
+        assert "not on your roster" in nope["error"]
+        slot = _tool("move_player", player=bench_wr["name"], to_slot="LB")
+        assert "Unknown slot" in slot["error"]
+    finally:
+        srv._board = None
 
 
 def test_get_waiver_targets_ranks_by_lineup_gain_and_suggests_drops():

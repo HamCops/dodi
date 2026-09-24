@@ -15,11 +15,13 @@ from mcp.server import MCPServer
 
 from . import __version__
 from .board import DraftBoard
+from .constants import SLOT_BY_ID
 from .config import Config, load_config
 from .espn import ESPNError
 from .scoring import LeagueShape
 from .season import (
     ROS_KEY,
+    SLOT_ID_BY_NAME,
     WEEK_KEY,
     current_starters,
     describe_transaction,
@@ -28,6 +30,8 @@ from .season import (
     league_position_averages,
     lineup_changes,
     optimal_lineup,
+    plan_lineup,
+    plan_move,
     roster_profile,
     waiver_gain,
 )
@@ -43,7 +47,10 @@ mcp = MCPServer(
         "and start/sit, get_waiver_targets for who to add and drop, analyze_trade "
         "to evaluate a specific offer, find_trade_partners to see which teams have "
         "what you need, get_transactions for history (lineup moves, adds, drops, "
-        "trades, with timestamps; rosters only show the present). Rankings are by VORP (value over replacement), which already "
+        "trades, with timestamps; rosters only show the present). CHANGING THE LINEUP: "
+        "set_lineup previews the swaps to the best lineup by this week's projection "
+        "and applies them with apply=true; move_player puts one named player in one "
+        "slot (e.g. IR to BE). Both are real ESPN roster changes. Rankings are by VORP (value over replacement), which already "
         "accounts for positional scarcity in this league's specific lineup; do not "
         "re-rank by raw projected points. In season, VORP is over rest-of-season "
         "points; week_proj is ESPN's single-week projection and already reflects "
@@ -949,6 +956,122 @@ def get_matchup(week: int | None = None) -> dict:
     }
     if (n := _week_note(shape)):
         out["season_note"] = n
+    return out
+
+
+def _now_ms() -> int:
+    import time
+    return int(time.time() * 1000)
+
+
+def _move_row(m: dict) -> dict:
+    return {"player": m["name"], "from": m["from_slot"], "to": m["to_slot"]}
+
+
+@mcp.tool()
+@handle_errors
+def set_lineup(week: int | None = None, apply: bool = False) -> dict:
+    """Set the best lineup for a week, or preview the swaps it would make.
+
+    The best lineup is by ESPN's projection for that week (which reflects
+    the NFL opponent, injury designation and bye), the same one get_matchup
+    scores. Players whose game has kicked off are locked and kept where they
+    are; players on IR stay on IR (use move_player to activate one, which
+    needs a free bench spot). With apply=false (the default) nothing changes
+    on ESPN: the swaps and what they are worth come back for review. With
+    apply=true the swaps are submitted as one ESPN transaction.
+
+    Args:
+        week: defaults to the current week. Pass next week to set it early.
+        apply: submit the swaps to ESPN. False previews them.
+    """
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = week or b.week()
+    players = b.team_players(me, week)
+    if not players:
+        return {"error": f"No roster found for team {me} in week {week}."}
+    plan = plan_lineup(players, shape, WEEK_KEY, now_ms=_now_ms())
+    out: dict[str, Any] = {
+        "week": week,
+        "applied": False,
+        "moves": [_move_row(m) for m in plan["moves"]],
+        "set_total": plan["total_before"],
+        "optimal_total": plan["total_after"],
+        "gain": plan["gain"],
+        "starters_after": [
+            {**_slim_season(p), "slot": SLOT_BY_ID.get(sid, str(sid))}
+            for sid, p in plan["starters"]
+        ],
+        "locked": [p["name"] for p in plan["locked"]],
+        "unfillable_slots": plan["unfilled"],
+        "questionable": [f"{p['name']} is {p['injury_status']}" for _, p in plan["starters"]
+                         if p.get("injury_status") == "QUESTIONABLE"],
+    }
+    if not plan["moves"]:
+        out["note"] = "The set lineup is already the best one; nothing to do."
+        return out
+    if not apply:
+        out["note"] = "Preview only. Call again with apply=true to submit these swaps."
+        return out
+    result = b.client.set_lineup(me, week, plan["moves"])
+    b.league_rosters(week, refresh=True)
+    out["applied"] = True
+    out["espn_status"] = result.get("status")
+    out["transaction_id"] = result.get("id")
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def move_player(player: str, to_slot: str, week: int | None = None) -> dict:
+    """Move one of your players into a lineup slot on ESPN.
+
+    Slots: QB, RB, WR, TE, FLEX, K, D/ST, BE (bench), IR. Moving into a full
+    starting slot swaps out its lowest-projected starter, who goes to the
+    mover's old slot when eligible and the bench otherwise. Moving a player
+    out of IR needs a free bench spot (drop someone first). A player whose
+    game has started cannot be moved. This is a real ESPN roster change.
+
+    Args:
+        player: name, or a unique part of it.
+        to_slot: the slot to put him in.
+        week: defaults to the current week.
+    """
+    b = board()
+    shape = b.shape()
+    me = _require_team(b)
+    if not me:
+        return {"error": "ESPN_TEAM_ID is not set."}
+    week = week or b.week()
+    players = b.team_players(me, week)
+    found, problems = _resolve([player], players, "your roster")
+    if problems:
+        return {"error": problems[0]["problem"], **problems[0]}
+    mover = found[0]
+    slot_name = to_slot.strip().upper().replace("BENCH", "BE")
+    slot_name = {"DST": "D/ST", "DEF": "D/ST"}.get(slot_name, slot_name)
+    sid = SLOT_ID_BY_NAME.get(slot_name)
+    if sid is None:
+        return {"error": f"Unknown slot {to_slot!r}. Use one of: "
+                         f"{', '.join(SLOT_BY_ID[s] for s in sorted(shape.lineup_slots) if shape.lineup_slots[s])}."}
+    plan = plan_move(players, shape, mover, sid, WEEK_KEY, now_ms=_now_ms())
+    if "error" in plan:
+        return {"error": plan["error"]}
+    result = b.client.set_lineup(me, week, plan["moves"])
+    b.league_rosters(week, refresh=True)
+    out: dict[str, Any] = {
+        "week": week,
+        "applied": True,
+        "moves": [_move_row(m) for m in plan["moves"]],
+        "espn_status": result.get("status"),
+        "transaction_id": result.get("id"),
+    }
+    if plan.get("displaced"):
+        out["displaced"] = plan["displaced"]["name"]
     return out
 
 

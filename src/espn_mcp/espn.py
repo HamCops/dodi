@@ -17,6 +17,8 @@ import httpx
 from .config import Config
 
 BASE = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl"
+# Roster changes go to a separate host. Same league path, same cookies.
+WRITE_BASE = "https://lm-api-writes.fantasy.espn.com/apis/v3/games/ffl"
 
 # The only domain the login cookies may ever be sent to, and the only one a
 # request may start at: anything else is refused before it is made, so no
@@ -83,24 +85,12 @@ class ESPNClient:
     def _league_url(self) -> str:
         return f"{BASE}/seasons/{self.cfg.season}/segments/0/leagues/{self.cfg.league_id}"
 
-    def _get(self, url: str, *, views: list[str], fantasy_filter: dict | None = None,
-             params: dict | None = None) -> Any:
-        headers = {}
-        if fantasy_filter is not None:
-            headers["x-fantasy-filter"] = json.dumps(fantasy_filter)
-        query: dict[str, Any] = dict(params or {})
-        # httpx encodes a list value as repeated keys, which is what ESPN wants.
-        query["view"] = views
+    @property
+    def _league_write_url(self) -> str:
+        return f"{WRITE_BASE}/seasons/{self.cfg.season}/segments/0/leagues/{self.cfg.league_id}"
 
-        if not host_allowed(url):
-            raise ESPNError(f"Refusing to call a non-ESPN URL: {url}")
-        try:
-            resp = self._client.get(url, params=query, headers=headers)
-        except httpx.HTTPError as exc:
-            # Scrub the cause too: a formatted traceback prints it verbatim.
-            exc.args = tuple(self._scrub(a) if isinstance(a, str) else a for a in exc.args)
-            raise ESPNError(self._scrub(f"Network error talking to ESPN: {exc}")) from exc
-
+    def _check(self, resp: httpx.Response) -> Any:
+        """Turn an ESPN response into JSON, or into an actionable ESPNError."""
         if resp.status_code in (401, 403):
             raise ESPNError(
                 "ESPN rejected the credentials (HTTP "
@@ -115,11 +105,83 @@ class ESPNClient:
             )
         if resp.status_code >= 400:
             raise ESPNError(f"ESPN returned HTTP {resp.status_code}: {self._scrub(resp.text)[:300]}")
-
         try:
             return resp.json()
         except ValueError as exc:
             raise ESPNError("ESPN returned a non-JSON body (often an auth redirect).") from exc
+
+    def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        if not host_allowed(url):
+            raise ESPNError(f"Refusing to call a non-ESPN URL: {url}")
+        try:
+            return self._client.request(method, url, **kwargs)
+        except httpx.HTTPError as exc:
+            # Scrub the cause too: a formatted traceback prints it verbatim.
+            exc.args = tuple(self._scrub(a) if isinstance(a, str) else a for a in exc.args)
+            raise ESPNError(self._scrub(f"Network error talking to ESPN: {exc}")) from exc
+
+    def _get(self, url: str, *, views: list[str], fantasy_filter: dict | None = None,
+             params: dict | None = None) -> Any:
+        headers = {}
+        if fantasy_filter is not None:
+            headers["x-fantasy-filter"] = json.dumps(fantasy_filter)
+        query: dict[str, Any] = dict(params or {})
+        # httpx encodes a list value as repeated keys, which is what ESPN wants.
+        query["view"] = views
+
+        resp = self._send("GET", url, params=query, headers=headers)
+        return self._check(resp)
+
+    # --- Writes -----------------------------------------------------------
+
+    def post_transaction(self, body: dict) -> dict:
+        """Submit one roster transaction for this league and return ESPN's record.
+
+        Needs the login cookies: ESPN has no anonymous writes. The body is
+        the v3 transaction shape (type, teamId, memberId, items[]); callers
+        build it with `lineup_transaction`.
+        """
+        if not self.cfg.has_auth:
+            raise ESPNError(
+                "Roster changes need ESPN_S2 and SWID set; the league is read-only "
+                "without them."
+            )
+        resp = self._send("POST", f"{self._league_write_url}/transactions/", json=body,
+                          headers={"Content-Type": "application/json"})
+        data = self._check(resp)
+        if isinstance(data, dict) and data.get("status") not in (None, "EXECUTED"):
+            raise ESPNError(f"ESPN did not execute the transaction: {data.get('status')}")
+        return data
+
+    def lineup_transaction(self, team_id: int, week: int, moves: list[dict]) -> dict:
+        """A ROSTER transaction moving each player in `moves` between slots.
+
+        Each move is {player_id, from_slot_id, to_slot_id}. ESPN validates the
+        end state, so a swap of two starters must be one transaction with
+        both items.
+        """
+        return {
+            "isLeagueManager": False,
+            "teamId": int(team_id),
+            "type": "ROSTER",
+            "memberId": self.cfg.swid,
+            "scoringPeriodId": int(week),
+            "executionType": "EXECUTE",
+            "items": [
+                {
+                    "playerId": int(m["player_id"]),
+                    "type": "LINEUP",
+                    "fromLineupSlotId": int(m["from_slot_id"]),
+                    "toLineupSlotId": int(m["to_slot_id"]),
+                }
+                for m in moves
+            ],
+        }
+
+    def set_lineup(self, team_id: int, week: int, moves: list[dict]) -> dict:
+        if not moves:
+            return {"status": "NOOP", "items": []}
+        return self.post_transaction(self.lineup_transaction(team_id, week, moves))
 
     # --- League views -----------------------------------------------------
 

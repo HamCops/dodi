@@ -28,6 +28,10 @@ from .scoring import LeagueShape
 ROS_KEY = "ros_per_game"
 WEEK_KEY = "week_proj"
 
+BENCH_SLOT_ID = 20
+IR_SLOT_ID = 21
+SLOT_ID_BY_NAME = {name: sid for sid, name in SLOT_BY_ID.items()}
+
 
 # --------------------------------------------------------------------------
 # Rest-of-season
@@ -68,28 +72,33 @@ def attach_ros(players: list[dict], current_week: int, final_week: int,
 # --------------------------------------------------------------------------
 
 
-def starting_slots(shape: LeagueShape) -> list[tuple[str, tuple[str, ...]]]:
-    """Starting slots in fill order: dedicated first, then flex, tightest first.
+def starting_slot_ids(shape: LeagueShape) -> list[tuple[int, tuple[str, ...]]]:
+    """Starting slot ids in fill order: dedicated first, then flex, tightest first.
 
     Filling dedicated slots with the best players at each position and then
     flex from whoever is left is optimal whenever every flex slot's eligible
     set contains the dedicated positions it draws from (the normal case).
     """
-    dedicated: list[tuple[str, tuple[str, ...]]] = []
-    flex: list[tuple[str, tuple[str, ...]]] = []
+    dedicated: list[tuple[int, tuple[str, ...]]] = []
+    flex: list[tuple[int, tuple[str, ...]]] = []
     for slot_id, count in sorted(shape.lineup_slots.items()):
         if not count or slot_id in NON_STARTING_SLOTS:
             continue
-        name = SLOT_BY_ID.get(slot_id, str(slot_id))
         pos = DEDICATED_SLOT_POSITION.get(slot_id)
         if pos:
-            dedicated.extend([(name, (pos,))] * count)
+            dedicated.extend([(slot_id, (pos,))] * count)
             continue
         eligible = FLEX_SLOT_ELIGIBILITY.get(slot_id)
         if eligible:
-            flex.extend([(name, eligible)] * count)
+            flex.extend([(slot_id, eligible)] * count)
     flex.sort(key=lambda s: len(s[1]))
     return dedicated + flex
+
+
+def starting_slots(shape: LeagueShape) -> list[tuple[str, tuple[str, ...]]]:
+    """`starting_slot_ids` with slot names instead of ids."""
+    return [(SLOT_BY_ID.get(sid, str(sid)), eligible)
+            for sid, eligible in starting_slot_ids(shape)]
 
 
 def _val(p: dict | None, key: str) -> float:
@@ -143,6 +152,129 @@ def lineup_changes(players: list[dict], shape: LeagueShape, key: str) -> dict:
         "sit": sit,
         "optimal": best,
     }
+
+
+def is_locked(p: dict, now_ms: int | None) -> bool:
+    """ESPN locks a player once his NFL game has kicked off."""
+    if now_ms is None:
+        return False
+    kickoff = p.get("kickoff_ms")
+    return kickoff is not None and int(kickoff) <= now_ms
+
+
+def plan_lineup(players: list[dict], shape: LeagueShape, key: str,
+                now_ms: int | None = None) -> dict:
+    """The slot moves that turn the set lineup into the best one by `key`.
+
+    Players whose game has started are locked: they keep their slot and the
+    lineup is optimized around them. Players on IR stay on IR (moving one
+    out needs a free bench spot, which is a roster decision, not a lineup
+    one). Everyone else not starting goes to the bench.
+
+    Returns the moves ESPN needs ({player_id, from_slot_id, to_slot_id} per
+    changed player), the resulting starters by slot, both totals, who was
+    locked, and any starting slot nobody could fill.
+    """
+    locked = [p for p in players if is_locked(p, now_ms)]
+    locked_ids = {p["player_id"] for p in locked}
+    slots = list(starting_slot_ids(shape))
+    assignment: dict[int, int] = {}  # player_id -> slot_id
+    starters: list[tuple[int, dict]] = []
+
+    # Locked starters keep their slot; take that slot out of the pool.
+    for p in locked:
+        sid = p.get("slot_id")
+        if sid is None or sid in NON_STARTING_SLOTS:
+            continue
+        hit = next((i for i, (s, _) in enumerate(slots) if s == sid), None)
+        if hit is None:
+            continue
+        slots.pop(hit)
+        assignment[p["player_id"]] = sid
+        starters.append((sid, p))
+
+    pool = [p for p in players
+            if p["player_id"] not in locked_ids and p.get("slot_id") != IR_SLOT_ID]
+    pool.sort(key=lambda p: -_val(p, key))
+    unfilled: list[str] = []
+    for sid, eligible in slots:
+        pick = next((p for p in pool if p.get("position") in eligible), None)
+        if pick is None:
+            unfilled.append(SLOT_BY_ID.get(sid, str(sid)))
+            continue
+        pool.remove(pick)
+        assignment[pick["player_id"]] = sid
+        starters.append((sid, pick))
+    for p in pool:
+        assignment[p["player_id"]] = BENCH_SLOT_ID
+
+    moves = []
+    for p in players:
+        target = assignment.get(p["player_id"])
+        if target is None or p.get("slot_id") is None or target == p["slot_id"]:
+            continue
+        moves.append({"player_id": p["player_id"], "name": p.get("name"),
+                      "from_slot_id": p["slot_id"], "to_slot_id": target,
+                      "from_slot": SLOT_BY_ID.get(p["slot_id"], str(p["slot_id"])),
+                      "to_slot": SLOT_BY_ID.get(target, str(target))})
+
+    before = round(sum(_val(p, key) for p in current_starters(players)), 2)
+    after = round(sum(_val(p, key) for _, p in starters), 2)
+    return {
+        "moves": moves,
+        "starters": starters,
+        "total_before": before,
+        "total_after": after,
+        "gain": round(after - before, 2),
+        "locked": locked,
+        "unfilled": unfilled,
+    }
+
+
+def plan_move(players: list[dict], shape: LeagueShape, mover: dict, to_slot_id: int,
+              key: str, now_ms: int | None = None) -> dict:
+    """The moves that put `mover` in `to_slot_id`, displacing someone if full.
+
+    A full starting slot displaces its lowest-`key` occupant, who takes the
+    mover's old slot when eligible for it and the bench otherwise. Returns
+    {moves} or {error}.
+    """
+    from_sid = mover.get("slot_id")
+    if from_sid == to_slot_id:
+        return {"error": f"{mover['name']} is already in {SLOT_BY_ID.get(to_slot_id, to_slot_id)}."}
+    if is_locked(mover, now_ms):
+        return {"error": f"{mover['name']} is locked: his game has started."}
+    to_name = SLOT_BY_ID.get(to_slot_id, str(to_slot_id))
+    if to_name not in (mover.get("eligible_slots") or [to_name]):
+        return {"error": f"{mover['name']} ({mover.get('position')}) is not eligible for {to_name}."}
+    capacity = shape.lineup_slots.get(to_slot_id, 0)
+    if to_slot_id == IR_SLOT_ID and mover.get("injury_status") not in (
+            "OUT", "INJURY_RESERVE", "SUSPENSION", "PUP", "DOUBTFUL"):
+        return {"error": f"{mover['name']} is {mover.get('injury_status')}; ESPN only allows "
+                         "OUT/IR-designated players in IR."}
+    if not capacity:
+        return {"error": f"This league has no {to_name} slot."}
+
+    moves = [{"player_id": mover["player_id"], "name": mover["name"],
+              "from_slot_id": from_sid, "to_slot_id": to_slot_id,
+              "from_slot": SLOT_BY_ID.get(from_sid, str(from_sid)), "to_slot": to_name}]
+    occupants = [p for p in players if p.get("slot_id") == to_slot_id
+                 and p["player_id"] != mover["player_id"]]
+    if len(occupants) < capacity:
+        return {"moves": moves}
+    if to_slot_id == BENCH_SLOT_ID:
+        return {"error": "The bench is full; drop someone first."}
+    free = [p for p in occupants if not is_locked(p, now_ms)]
+    if not free:
+        return {"error": f"Every {to_name} starter is locked; nobody can be moved out."}
+    out = min(free, key=lambda p: _val(p, key))
+    from_name = SLOT_BY_ID.get(from_sid, str(from_sid))
+    back = (from_sid if from_sid not in NON_STARTING_SLOTS
+            and from_name in (out.get("eligible_slots") or []) else BENCH_SLOT_ID)
+    moves.append({"player_id": out["player_id"], "name": out["name"],
+                  "from_slot_id": to_slot_id, "to_slot_id": back,
+                  "from_slot": to_name, "to_slot": SLOT_BY_ID.get(back, str(back))})
+    return {"moves": moves, "displaced": out}
 
 
 # --------------------------------------------------------------------------
