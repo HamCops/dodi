@@ -243,25 +243,6 @@ first real use of each is its live check.
 softest matchup, 32 = stingiest. It is empty until games have been played, so
 it appears from week 2.
 
-## Desktop: live matchup in the Omarchy bar
-
-`scripts/feed_sync.py` bridges this league into the
-[Fantasy Feed](https://github.com/HamCops/omarchy-fantasy-feed) Omarchy plugin
-(a fork with league support). It writes your and your opponent's starters,
-the league's scoring rules, and ESPN's live matchup totals into files the
-plugin watches, so the bar shows `ME 41.2 – 37.9 TM2` and the panel shows
-both lineups scored the way ESPN scores them. The plugin never sees your
-cookies; this script does the fantasy-API reads.
-
-```bash
-./.venv/bin/python scripts/feed_sync.py --once            # sync now
-./.venv/bin/python scripts/feed_sync.py --install-service # then enable the unit it prints
-```
-
-The service re-syncs every 15 minutes while nothing is on. While the plugin
-reports games in progress it re-syncs every minute, lineups included, so a
-start/sit change on ESPN reaches the bar within a minute.
-
 ## ESPN quirks handled
 
 Found by running against a real league; each has a regression test.
@@ -382,5 +363,4 @@ src/espn_mcp/
 scripts/
   doctor.py      pre-draft credential and access check
   snapshot.py    offline fallback board
-  feed_sync.py   bridge to the Omarchy Fantasy Feed plugin (matchup + scoring)
 ```
