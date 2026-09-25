@@ -481,10 +481,15 @@ class SeasonClient(FakeClient):
         for w in range(1, 15):
             rot = ids[:1] + ids[1:][-(w - 1) % (TEAMS - 1):] + ids[1:][:-(w - 1) % (TEAMS - 1) or None]
             for i in range(TEAMS // 2):
+                # Mirror ESPN mid-week: totalPoints stays 0 and the running
+                # score is only in totalPointsLive for the current week.
+                live = w == WEEK
                 out.append({"matchupPeriodId": w, "winner": "UNDECIDED",
                             "home": {"teamId": rot[i], "totalPoints": 0.0,
+                                     "totalPointsLive": 89.0 if live else 0.0,
                                      "totalProjectedPoints": 100.0, "winProbability": 0.55},
                             "away": {"teamId": rot[-1 - i], "totalPoints": 0.0,
+                                     "totalPointsLive": 82.0 if live else 0.0,
                                      "totalProjectedPoints": 95.0}})
         return out
 
@@ -562,6 +567,8 @@ def test_get_matchup_finds_opponent_and_start_sit():
     assert out["me"]["team_id"] == CFG.team_id
     assert out["opponent"]["team_id"] != CFG.team_id
     assert out["espn"]["my_win_probability"] in (0.55, 0.45)
+    # Mid-week ESPN only fills the *Live fields; the score must come from there.
+    assert {out["espn"]["my_points"], out["espn"]["their_points"]} == {89.0, 82.0}
     lineup = out["my_lineup"]
     assert lineup["optimal_total"] >= lineup["set_total"]
     assert lineup["gain_from_optimal"] == pytest.approx(

@@ -292,6 +292,25 @@ def weekly_projections(player: dict, season: int, shape: LeagueShape) -> dict[in
     return out
 
 
+def weekly_actual_points(player: dict, season: int, shape: LeagueShape) -> dict[int, float]:
+    """week -> league-scored points actually scored, for the weeks ESPN returned.
+
+    Like `weekly_projections`, normally just the week named by the request's
+    `scoringPeriodId`. Empty before that week's first kickoff.
+    """
+    pos_id = int(player.get("defaultPositionId") or 0)
+    out: dict[int, float] = {}
+    for entry in player.get("stats") or []:
+        if (
+            entry.get("statSourceId") == STAT_SOURCE_ACTUAL
+            and entry.get("statSplitTypeId") == STAT_SPLIT_WEEKLY
+            and int(entry.get("seasonId") or 0) == season
+            and entry.get("scoringPeriodId")
+        ):
+            out[int(entry["scoringPeriodId"])] = _stat_total(entry, pos_id, shape)
+    return out
+
+
 def score_stat_line(stats: dict, position_id: int, items: list[ScoringItem]) -> float:
     """Apply this league's scoring rules to a raw {statId: value} line."""
     total = 0.0
@@ -356,6 +375,7 @@ def normalize_player(entry: dict, season: int, shape: LeagueShape) -> dict:
         "projected_points": projected_points(player, season, shape),
         "season_points": season_actual_points(player, season, shape),
         "week_projections": weekly_projections(player, season, shape),
+        "week_points": weekly_actual_points(player, season, shape),
         "roster_status": status,          # FREEAGENT / WAIVERS / ONTEAM
         "on_team_id": on_team or None,
         "waiver_clears_ms": waiver_clears,

@@ -27,6 +27,12 @@ from .value import build_value_board, value_vs_adp
 PLACEHOLDER_PLAYER_ID = -1
 
 
+def _live_first(side: dict, key: str):
+    """`<key>Live` when ESPN reports it, else `<key>` (final or pre-kickoff)."""
+    live = side.get(key + "Live")
+    return live if live else side.get(key)
+
+
 class DraftBoard:
     def __init__(self, cfg: Config, client: ESPNClient | None = None) -> None:
         self.cfg = cfg
@@ -616,10 +622,13 @@ class DraftBoard:
                 "week": int(m.get("matchupPeriodId") or 0),
                 "home_team_id": int(home.get("teamId") or 0),
                 "away_team_id": int(away.get("teamId") or 0),
-                "home_points": home.get("totalPoints"),
-                "away_points": away.get("totalPoints"),
-                "home_espn_proj": home.get("totalProjectedPointsLive") or home.get("totalProjectedPoints"),
-                "away_espn_proj": away.get("totalProjectedPointsLive") or away.get("totalProjectedPoints"),
+                # While the week is in progress ESPN leaves totalPoints at 0
+                # and reports the running score in the *Live fields; the
+                # non-Live fields are only filled in once the week is final.
+                "home_points": _live_first(home, "totalPoints"),
+                "away_points": _live_first(away, "totalPoints"),
+                "home_espn_proj": _live_first(home, "totalProjectedPoints"),
+                "away_espn_proj": _live_first(away, "totalProjectedPoints"),
                 "home_win_prob": home.get("winProbability"),
                 "winner": m.get("winner"),
                 "playoff": m.get("playoffTierType") not in (None, "NONE"),
