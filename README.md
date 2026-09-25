@@ -1,4 +1,4 @@
-# espn-mcp
+# D.O.D.I.
 
 An MCP server that gives your AI agent full control of an ESPN fantasy football
 league — draft picks, weekly lineups, waivers, trades, and roster moves. Wire
