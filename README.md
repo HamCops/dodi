@@ -5,7 +5,8 @@ league — draft picks, weekly lineups, waivers, trades, and roster moves. Wire
 it into any MCP-compatible harness (Claude Code, Hermes, your own), give the
 agent a persona and a cron schedule, and let it run your season.
 
-We call ours **Dodi**. Dodi checks the waiver wire every afternoon, optimizes
+We call ours **Dodi** — **D**raft **O**ptimization & **D**ynasty
+**I**ntelligence. Dodi checks the waiver wire every afternoon, optimizes
 the lineup before kickoff, scouts trade partners, fires off offers, responds to
 incoming trades, and pings us on the phone when something happens. Dodi doesn't
 ask permission to set the best lineup. Dodi does ask before trading away your
