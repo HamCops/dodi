@@ -529,3 +529,94 @@ def test_a_token_that_is_not_ascii_is_simply_wrong(store):
     assert store.authorized(p["id"], "t\u00f6ken\u2603") is None
     assert store.authorized("nope", "\u2603") is None
     assert store.authorized(p["id"], p["token"])["id"] == p["id"]
+
+
+# --- what the model writes is checked against what the tools returned ----------
+
+
+def test_a_number_must_be_one_the_tools_gave():
+    from espn_mcp.factcheck import unsupported_numbers as check
+
+    preview = {"add": {"name": "A Back", "ros_pg": 8.39, "vorp": 24.87, "adds_24h": 3994120,
+                       "market": {"value": 1454}},
+               "delta": {"starters_ros_per_game": 1.82},
+               "waivers_clear": "Wed Sep 30 07:00 AM"}
+    ok = ("Adds 1.82 a game. He is at 8.4 a game with VORP 24.87, 3.99M adds, value "
+          "1,454. Claims clear Sep 30 at 7:00. He has 3 games and is RB2 in 2026.")
+    assert check(ok, preview) == []
+    # Close is not the same: 7.94 belongs to some other player.
+    assert check("He scores 7.94 a game and adds 1.82.", preview) == ["7.94"]
+    # Arithmetic of the model's own is not a fact from the tools.
+    assert check("Worth 23.05 more than the man he replaces.", preview) == ["23.05"]
+    assert check("Up +2.5 with 45 carries and 4.1M adds.", preview) == ["+2.5", "45", "4.1M"]
+    assert check("No numbers at all, only a reason.", preview) == []
+    assert check("", preview) == [] and check(None, preview) == []
+    # Letters joined to digits are labels, not statistics.
+    assert check("He is the WR14 and the TE2 on a 4-3 team.", {}) == []
+
+
+def test_a_move_explained_with_a_wrong_number_is_sent_back(league):
+    b, pushes = league
+    free = b.season_available()[0]
+    bad = _tool("request_approval", action="add_player", params={"add": free["name"]},
+                reasoning="He projects for 99.7 a game from here.")
+    assert bad["queued"] is False and bad["unsupported_numbers"] == ["99.7"]
+    assert "copied from the preview" in bad["error"] and pushes == []
+
+    right = str(free["ros_points"])
+    good = _tool("request_approval", action="add_player", params={"add": free["name"]},
+                 reasoning=f"He projects for {right} the rest of the way.")
+    assert good["queued"] is True and len(pushes) == 1
+
+
+def test_the_push_says_which_part_is_fact_and_which_is_opinion(store, monkeypatch):
+    import espn_mcp.notify as notify
+
+    sent = {}
+    monkeypatch.setattr(notify, "push", lambda cfg, title, message, **kw: sent.update(
+        title=title, message=message) or {"sent": True})
+    p = store.create("drop_player", {"player": "id:1"}, title="Dodi: drop X?",
+                     summary="Drop X (WR).", reasoning="He has no role.")
+    notify.push_proposal(CFG, p)
+    assert sent["message"].index("THE MOVE") < sent["message"].index("Drop X (WR).") \
+        < sent["message"].index("DODI'S VIEW") < sent["message"].index("He has no role.")
+
+
+def test_the_fact_sheet_names_what_is_locked_and_what_is_queued(league, monkeypatch):
+    import espn_mcp.report as report
+    import espn_mcp.server as srv
+
+    b, _ = league
+    mine = b.team_players(CFG.team_id)
+    kickoff = max(p["kickoff_ms"] for p in mine if p.get("kickoff_ms")) / 1000
+    before = report.facts(b, kickoff - 365 * 86400)
+    assert "Locked (game started" in before and "cannot be moved" in before
+    assert before.split("Can be moved or dropped now: ")[1].startswith(mine[0]["name"][:3]) \
+        or mine[0]["name"] in before
+    after = report.facts(b, kickoff + 3600)
+    assert "Can be moved or dropped now: none." in after
+    assert "Open trades: none." in after and "Approval queue, last 7 days: empty." in after
+
+    srv.proposal_store().create("drop_player", {"player": "id:1"}, title="t",
+                                summary="Drop Somebody (WR).", reasoning="r")
+    assert "[pending] Drop Somebody (WR)." in report.facts(b)
+
+
+def test_a_report_is_checked_against_what_the_tools_returned(league, monkeypatch):
+    import espn_mcp.server as srv
+
+    monkeypatch.setattr(srv, "_seen", {})
+    b, _ = league
+    roster = _tool("get_roster")
+    star = roster["starters"][0]
+    good = f"{star['name']} projects for {star['week_proj']} this week."
+    assert _tool("check_report", text=good) == {
+        "ok": True, "note": "Every number in the report was returned by a tool."}
+
+    bad = _tool("check_report", text=good + " He averages 93.17 and is worth 88,123.")
+    assert bad["ok"] is False and bad["unsupported_numbers"] == ["93.17", "88,123"]
+    assert "remove it" in bad["instruction"]
+
+    # What a tool returned long ago no longer vouches for anything.
+    monkeypatch.setattr(srv, "_seen", {v: 0.0 for v in srv._seen})
+    assert _tool("check_report", text=good)["ok"] is False

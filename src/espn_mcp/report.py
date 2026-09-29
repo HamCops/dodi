@@ -201,6 +201,68 @@ def render(r: dict) -> str:
     return "\n".join(lines)
 
 
+def facts(b: DraftBoard, now: float | None = None) -> str:
+    """The state of things, for an agent to copy from rather than recall.
+
+    Printed into the agent's prompt before each run. Everything here is read
+    from ESPN or the queue at that moment; nothing is inferred.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from .season import is_locked
+    from .server import _pending_proposals, _describe_proposal, proposal_store
+
+    now = time.time() if now is None else now
+    zone = ZoneInfo(b.cfg.timezone)
+    when = lambda ts: datetime.fromtimestamp(ts, zone).strftime("%a %b %-d %-I:%M %p")  # noqa: E731
+    week = b.week()
+    mine = b.team_players(b.cfg.team_id, week)
+    locked = [p["name"] for p in mine if is_locked(p, int(now * 1000))]
+    free = [p["name"] for p in mine if p["name"] not in locked]
+    lines = ["FACTS (read from ESPN and the approval queue just now; copy names, "
+             "numbers and statuses from here and from tool results, never from memory)",
+             f"- Now: {when(now)} {b.cfg.timezone}. ESPN week: {week}.",
+             f"- Roster: {len(mine)} players. Locked (game started, cannot be moved or "
+             f"dropped until the week rolls over): {', '.join(locked) or 'none'}.",
+             f"- Can be moved or dropped now: {', '.join(free) or 'none'}."]
+    for pos in ("D/ST", "K"):
+        held = [p["name"] for p in mine if p["position"] == pos]
+        lines.append(f"- {pos} on roster: {len(held)} ({', '.join(held) or 'none'}).")
+    trades = [_describe_proposal(b, t, b.cfg.team_id, week)
+              for t in _pending_proposals(b, b.cfg.team_id)]
+    if trades:
+        for t in trades:
+            give = ", ".join(p["name"] for p in t["give"])
+            get = ", ".join(p["name"] for p in t["receive"])
+            lines.append(f"- Open trade {t['trade_id']}: proposed by {t['proposed_by']}, with "
+                         f"{t['partner'].get('name')}; I give {give}; I get {get}.")
+    else:
+        lines.append("- Open trades: none.")
+    recent = [p for p in proposal_store().list(limit=20) if now - p["created_at"] < 7 * 86400]
+    if recent:
+        lines.append("- Approval queue, last 7 days:")
+        for p in recent:
+            from .approve import _plain_error
+            note = _plain_error(p["result"]) if (p.get("result") or {}).get("error") else ""
+            lines.append(f"    [{p['status']}] {p['summary']}"
+                         + (f" Decide by {when(p['expires_at'])}." if p["status"] == "pending" else "")
+                         + (f" Error: {note[:160]}" if note else ""))
+    else:
+        lines.append("- Approval queue, last 7 days: empty.")
+    return "\n".join(lines)
+
+
+def facts_main() -> None:
+    import logging
+    logging.disable(logging.CRITICAL)
+    from .server import board
+    try:
+        print(facts(board()))
+    except Exception as exc:  # noqa: BLE001 - the agent run must still happen
+        print(f"FACTS unavailable ({type(exc).__name__}: {exc}). Rely on tool results only.")
+
+
 def main() -> None:
     import logging
     logging.getLogger("httpx").setLevel(logging.WARNING)

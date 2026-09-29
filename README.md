@@ -136,6 +136,7 @@ sent elsewhere. They expire mid-season; an auth error means re-copy them.
 |---|---|
 | `request_approval` | Queue an add, drop, trade offer, trade answer or start/sit call for the manager. Previewed first; sent to ESPN only when approved. |
 | `get_proposals` | What is waiting, and what was approved, rejected or expired. |
+| `check_report` | Is every number in this report one a tool returned in the last 45 minutes? For the agent to run on its own report before delivering it. |
 
 ## Running it hands-off
 
@@ -157,6 +158,25 @@ the open internet: approving a proposal makes a real roster move. Each
 proposal has its own token, a decision can be made once, and a proposal
 interrupted mid-send is closed, never retried.
 
+### What the agent writes is checked
+
+The numbers behind a move are computed in code. The sentence explaining it
+is written by a language model, which will now and then write a number that
+is close to the right one or belongs to another player. So:
+
+- `request_approval` refuses reasoning that quotes a number not in the
+  move's own preview, and says which.
+- `check_report` does the same for a whole report, against every number
+  the tools have returned lately.
+- The notification labels its two parts: **THE MOVE**, built by the server
+  from ESPN's data, and the agent's view, in the agent's words.
+- `espn-mcp-facts` prints what is true right now (the week, who is locked,
+  open trades, the queue) for a scheduler to put in front of the agent's
+  prompt, so that it is copied and not recalled.
+
+Only numbers can be checked this way. A right number on the wrong player,
+or sound numbers and a poor conclusion, still get through.
+
 ### Decisions by the kickoff clock
 
 Run `espn-mcp-tick` every five minutes. For each group of games on your
@@ -171,6 +191,15 @@ roster it counts back from the real kickoff:
 Both runs come after inactives are announced, and leave
 `APPROVAL_LEAD_MINUTES` (default 30) to answer. `espn-mcp-tick status`
 prints the week's plan.
+
+Once a week there is a third run. By Monday night every player on a roster
+has played and is locked, so nobody can be dropped and no pickup made, until
+ESPN rolls over to the new week. The scheduler watches for that and calls
+the hook with `roster` the first time it sees it between 9 AM and 9 PM, so
+claims reach you as early as they can be made.
+
+The hook is called as `<hook> <agent|roster> <weekday> <kickoff>` and should
+start the agent and return at once, not wait for it.
 
 ### Outside data
 
@@ -333,6 +362,7 @@ src/espn_mcp/
   gametime.py    scheduling counted back from kickoff
   autolineup.py  set the lineup without a model
   usage.py       expected points from workload              (pure, tested)
+  factcheck.py   numbers in the agent's text against the tools'  (pure, tested)
   market.py      trade arithmetic on market values          (pure, tested)
   tracking.py    what was known before kickoff, for scoring later
   report.py      the weekly review

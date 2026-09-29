@@ -79,9 +79,11 @@ def deadline(cfg: Config, proposal: dict, now: float | None = None) -> dict[str,
 def push_proposal(cfg: Config, proposal: dict) -> dict[str, Any]:
     actions = approval_actions(cfg, proposal)
     by = deadline(cfg, proposal)
-    message = f"Decide by {by['text']}.\n\n" + proposal["summary"]
+    # The summary is built in code from ESPN's data. The reasoning is the
+    # agent's own words. They are labelled so the two are never confused.
+    message = f"Decide by {by['text']}.\n\nTHE MOVE\n" + proposal["summary"]
     if proposal.get("reasoning"):
-        message += "\n\n" + proposal["reasoning"]
+        message += "\n\nDODI'S VIEW\n" + proposal["reasoning"]
     if not actions:
         message += f"\n\n(No approval link configured; proposal {proposal['id']}.)"
     title = proposal["title"]

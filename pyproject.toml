@@ -23,6 +23,7 @@ espn-mcp-approve = "espn_mcp.approve:main"
 espn-mcp-lineup = "espn_mcp.autolineup:main"
 espn-mcp-tick = "espn_mcp.gametime:main"
 espn-mcp-report = "espn_mcp.report:main"
+espn-mcp-facts = "espn_mcp.report:facts_main"
 
 [build-system]
 requires = ["hatchling"]

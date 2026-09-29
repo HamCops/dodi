@@ -19,6 +19,7 @@ from .board import DraftBoard
 from .constants import SLOT_BY_ID
 from .config import Config, load_config
 from .espn import ESPNError
+from .factcheck import known_numbers, unsupported_numbers
 from .market import acceptable, trade_view
 from .notify import deadline, push_proposal
 from .proposals import ProposalError, ProposalStore, clean_params, public
@@ -66,7 +67,10 @@ mcp = MCPServer(
         "with apply=true; confirm with the user before applying. APPROVAL: when a "
         "roster move or trade is refused because it needs approval, queue it with "
         "request_approval; the manager approves it from a notification and it is "
-        "sent then. get_proposals shows what is waiting and what was decided. Rankings are by VORP (value over replacement), which already "
+        "sent then. get_proposals shows what is waiting and what was decided. "
+        "ACCURACY: copy every number, name and status from a tool result; never "
+        "recall or compute one. Before delivering a report, call check_report with "
+        "its text and deliver it only once ok is true. Rankings are by VORP (value over replacement), which already "
         "accounts for positional scarcity in this league's specific lineup; do not "
         "re-rank by raw projected points. In season, VORP is over rest-of-season "
         "points; week_proj is ESPN's single-week projection and already reflects "
@@ -91,13 +95,40 @@ def handle_errors(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except ESPNError as exc:
             return {"error": str(exc), "recoverable": True}
         except Exception as exc:  # noqa: BLE001 - tool boundary
             return {"error": f"{type(exc).__name__}: {exc}", "recoverable": False}
+        _remember(result)
+        return result
 
     return wrapper
+
+
+# Every number the tools have handed out lately. A report is checked against
+# these: a number in it that no tool returned was not read, it was recalled.
+SEEN_FOR = 45 * 60
+_seen: dict[float, float] = {}
+
+
+def _remember(result) -> None:
+    import time
+    now = time.time()
+    try:
+        for value in known_numbers(result):
+            _seen[value] = now
+        if len(_seen) > 200_000:
+            for value in [v for v, at in _seen.items() if now - at > SEEN_FOR]:
+                del _seen[value]
+    except Exception:  # noqa: BLE001 - bookkeeping must never fail a tool
+        pass
+
+
+def _seen_lately() -> list[float]:
+    import time
+    now = time.time()
+    return [v for v, at in _seen.items() if now - at <= SEEN_FOR]
 
 
 def _slim(p: dict) -> dict:
@@ -2448,7 +2479,11 @@ def request_approval(action: str, params: dict, reasoning: str) -> dict:
             {"give": ["A"], "receive": ["B"], "partner_team_id": 6},
             {"trade_id": "...", "action": "accept"}.
         reasoning: why this move, in two or three sentences. The manager
-            reads this on his phone when deciding.
+            reads this on his phone when deciding. Every number in it must
+            be one from the preview of the move (call the tool with
+            apply=false first and copy from its result); a number that is
+            not is refused. Do not compute new numbers. Names as the tools
+            spell them.
     """
     try:
         params = clean_params(action, params or {})
@@ -2458,6 +2493,17 @@ def request_approval(action: str, params: dict, reasoning: str) -> dict:
     preview = _writers()[action](**params, apply=False)
     if "error" in preview:
         return {"queued": False, "error": preview["error"], "preview": preview}
+    unsupported = unsupported_numbers(reasoning or "", preview)
+    if unsupported:
+        return {
+            "queued": False,
+            "error": ("The reasoning quotes numbers that are not in the preview of this "
+                      "move: " + ", ".join(unsupported) + ". The manager decides on what "
+                      "you write, so every number must be copied from the preview. "
+                      "Correct them or leave them out, and call request_approval again."),
+            "unsupported_numbers": unsupported,
+            "preview": preview,
+        }
     params = _by_id(action, params, preview)
     blocking = store.find_blocking(action, params)
     if blocking:
@@ -2496,6 +2542,34 @@ def get_proposals(status: str | None = None, limit: int = 10) -> dict:
     """
     rows = proposal_store().list(status, limit)
     return {"count": len(rows), "proposals": [public(p) for p in rows]}
+
+
+@mcp.tool()
+def check_report(text: str) -> dict:
+    """Check a report before it is delivered: is every number in it one that
+    a tool actually returned?
+
+    Call this with the full text of any report for the manager, and deliver
+    the report only when `ok` is true. A number listed as unsupported was
+    not returned by any tool in the last 45 minutes: it was misremembered,
+    belongs to something else, or was computed by you. Look it up again with
+    the tool it should have come from, or take it out.
+
+    Numbers are all that can be checked this way. For names and statuses:
+    spell players and teams as the tools do, and when a tool returned an
+    error, give its own words, not a summary of them.
+
+    Args:
+        text: the report, as it will be delivered.
+    """
+    missing = unsupported_numbers(text or "", _seen_lately())
+    if not missing:
+        return {"ok": True, "note": "Every number in the report was returned by a tool."}
+    return {"ok": False, "unsupported_numbers": missing,
+            "instruction": ("These were not returned by any tool in this run. For each: "
+                            "call the tool again and copy the value, or remove it. Do not "
+                            "compute sums, differences or percentages yourself. Then call "
+                            "check_report again with the corrected text.")}
 
 
 def execute_proposal(proposal: dict) -> dict:
