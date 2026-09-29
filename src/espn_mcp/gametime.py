@@ -15,6 +15,14 @@ where `lead` is the time the manager wants to decide in (30 minutes unless
 configured). Requests expire 5 minutes before kickoff, so what is sent at
 lead + 15 leaves him lead + 10.
 
+Once a week there is a third run, tied to no kickoff. When a week ends,
+every player on the roster has played and is locked: nobody can be dropped,
+so no pickup can be made. ESPN unlocks them when it rolls over to the new
+week, some time on Tuesday. The first tick to see that, in waking hours,
+starts the agent on roster moves (`<hook> roster ...`), so claims reach the
+manager as early as they can be made and he has until waivers run to
+answer. A run at a fixed hour would either miss the rollover or wait on it.
+
 `tick` is meant to be called every five minutes. It keeps the week's
 kickoffs on disk and only talks to ESPN when that list is stale or a run is
 due, so an idle tick costs nothing.
@@ -42,6 +50,10 @@ TICK = 5               # how often tick() is expected to run, in minutes
 
 REFRESH_IDLE = 6 * 3600     # re-read the schedule this often when nothing is near
 REFRESH_NEAR = 30 * 60      # and this often inside three hours of a kickoff
+REFRESH_WAITING = 20 * 60   # and this often when the week is over, watching for the next
+
+# Roster moves are not urgent to the minute. Do not wake the manager for them.
+WAKING_HOURS = (9, 21)
 
 
 def slots_for(players: list[dict], now_ms: float) -> list[dict]:
@@ -94,12 +106,26 @@ class Schedule:
         age = now - self.data.get("fetched_at", 0)
         nearest = min((s["kickoff_ms"] / 1000 - now for s in self.slots
                        if s["kickoff_ms"] / 1000 > now), default=None)
-        near = nearest is not None and nearest < 3 * 3600
+        if nearest is None:
+            return age > REFRESH_WAITING      # week over: the rollover is next
+        near = nearest < 3 * 3600
         return age > (REFRESH_NEAR if near else REFRESH_IDLE)
+
+    def roster_run_due(self, now: float, tz: str) -> bool:
+        """The week has rolled over, the roster is unlocked, and nobody has
+        yet been asked about roster moves for it."""
+        if not self.slots or self.data.get("roster_run_week") == self.data.get("week"):
+            return False
+        if not any(s["kickoff_ms"] / 1000 > now for s in self.slots):
+            return False
+        hour = datetime.fromtimestamp(now, ZoneInfo(tz)).hour
+        return WAKING_HOURS[0] <= hour < WAKING_HOURS[1]
 
     def replace(self, week: int, slots: list[dict], now: float) -> None:
         """Take a fresh list of slots, keeping what was already done."""
-        done = {s["kickoff_ms"]: s for s in self.slots} if self.data.get("week") == week else {}
+        same_week = self.data.get("week") == week
+        done = {s["kickoff_ms"]: s for s in self.slots} if same_week else {}
+        asked = self.data.get("roster_run_week")
         for s in slots:
             # A kickoff moved by a few minutes is still the same game.
             old = next((o for k, o in done.items() if abs(k - s["kickoff_ms"]) <= SLOT_WIDTH),
@@ -107,7 +133,8 @@ class Schedule:
             if old:
                 s["agent_done"] = old.get("agent_done", False)
                 s["lineup_done"] = old.get("lineup_done", False)
-        self.data = {"week": week, "fetched_at": now, "slots": slots}
+        self.data = {"week": week, "fetched_at": now, "slots": slots,
+                     "roster_run_week": asked}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +160,20 @@ def tick(now: float | None = None, *, board_fn: Callable | None = None,
         if not cfg.team_id:
             return ["ESPN_TEAM_ID is not set; nothing to schedule."]
         _refresh(b, sched, now)
+
+    if sched.roster_run_due(now, cfg.timezone):
+        week = sched.data["week"]
+        first = min(s["kickoff_ms"] for s in sched.slots)
+        if not (run_agent or cfg.gametime_hook):
+            sched.data["roster_run_week"] = week
+            did.append(f"roster run for week {week}: no hook configured, skipped")
+        elif (run_agent or _run_hook)({"kickoff_ms": first}, cfg.gametime_hook or "",
+                                      "roster"):
+            sched.data["roster_run_week"] = week
+            did.append(f"roster run for week {week}: started (players unlocked)")
+        else:
+            failed.append(f"roster run for week {week}: hook failed, will retry")
+        sched.save()
 
     for slot in sched.slots:
         for job in due(slot, now * 1000, cfg.approval_lead_minutes):
@@ -176,18 +217,20 @@ def _run_lineup() -> int:
     return run()
 
 
-def _run_hook(slot: dict, hook: str) -> bool:
+def _run_hook(slot: dict, hook: str, event: str = "agent") -> bool:
     """Hand the agent run to whatever drives the agent.
 
-    The hook is called as: <hook> agent <weekday> <kickoff, ISO 8601 UTC>,
-    with the weekday in the manager's time zone. It should start the agent
-    and return, not wait for it.
+    The hook is called as: <hook> <event> <weekday> <kickoff, ISO 8601 UTC>,
+    with the weekday in the manager's time zone. `event` is `agent` before a
+    group of games and `roster` when a new week unlocks the roster (the
+    kickoff is then the week's first). It should start the agent and
+    return, not wait for it.
     """
     when = datetime.fromtimestamp(slot["kickoff_ms"] / 1000, ZoneInfo("UTC"))
     from .config import load_config
     day = when.astimezone(ZoneInfo(load_config().timezone)).strftime("%A").lower()
     try:
-        subprocess.run([hook, "agent", day, when.strftime("%Y-%m-%dT%H:%M:%SZ")],
+        subprocess.run([hook, event, day, when.strftime("%Y-%m-%dT%H:%M:%SZ")],
                        check=True, timeout=60, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"gametime hook failed: {exc}", file=sys.stderr)
@@ -241,6 +284,14 @@ def status(now: float | None = None) -> str:
     fmt = lambda ms: datetime.fromtimestamp(ms / 1000, zone).strftime("%a %b %-d %-I:%M %p")  # noqa: E731
     lines = [f"Week {sched.data.get('week')}, times in {cfg.timezone}, "
              f"{lead} minutes to approve"]
+    if not sched.slots:
+        lines.append("Roster moves: every player has played and is locked. Waiting for "
+                     "ESPN to roll over to the next week; checked every 20 minutes.")
+    elif sched.data.get("roster_run_week") == sched.data.get("week"):
+        lines.append("Roster moves: the agent was asked when this week unlocked.  done")
+    else:
+        lines.append(f"Roster moves: unlocked. The agent is asked at the next tick between "
+                     f"{WAKING_HOURS[0]}:00 and {WAKING_HOURS[1]}:00.")
     for s in sched.slots:
         k = s["kickoff_ms"]
         lines.append(f"\nKickoff {fmt(k)}: {', '.join(s['players'])}")

@@ -87,9 +87,12 @@ def test_each_run_happens_once_and_idle_ticks_do_not_call_espn(tmp_path):
     b = Board(cfg, roster())
     log: list[str] = []
     kw = dict(board_fn=lambda: b, run_lineup=lambda: log.append("lineup") or 0,
-              run_agent=lambda slot, hook: log.append("agent") or True)
-    assert tick(at(1, 12) / 1000, **kw) == [] and b.reads == 1
+              run_agent=lambda slot, hook, event="agent": log.append(event) or True)
+    # The first look at a new week asks about roster moves, once.
+    assert tick(at(1, 12) / 1000, **kw) == [
+        "roster run for week 4: started (players unlocked)"] and b.reads == 1
     assert tick(at(1, 12, 5) / 1000, **kw) == [] and b.reads == 1     # idle: from disk
+    log.clear()
 
     did = tick((at(1, 20, 15) - 62 * MIN) / 1000, **kw)
     assert log == ["agent"] and "Thu 8:15 PM" in did[0]
@@ -102,6 +105,18 @@ def test_each_run_happens_once_and_idle_ticks_do_not_call_espn(tmp_path):
     for minute in range(11 * 60 + 40, 13 * 60 + 5, 5):
         tick(at(4, minute // 60, minute % 60) / 1000, **kw)
     assert log == ["agent", "lineup"]
+
+
+def _mark_roster_run(tmp_path, cfg):
+    sched = gametime.Schedule(tmp_path / f"gametime-{cfg.league_id}-{cfg.season}.json")
+    sched.data["roster_run_week"] = sched.data["week"]
+    sched.save()
+
+
+def _status(b, now, monkeypatch):
+    import espn_mcp.server as srv
+    monkeypatch.setattr(srv, "_board", b)
+    return gametime.status(now)
 
 
 def test_status_of_a_kickoff_that_moves_is_kept(tmp_path):
@@ -135,9 +150,13 @@ def test_a_failed_run_stays_owed_and_the_manager_is_told(tmp_path, monkeypatch):
     log: list[str] = []
     kw = dict(board_fn=lambda: b,
               run_lineup=lambda: log.append("lineup") or next(codes),
-              run_agent=lambda slot, hook: log.append("agent") or next(hooks))
+              run_agent=lambda slot, hook, event="agent": log.append(event) or next(hooks))
     k = at(1, 20, 15)
-    tick(at(1, 12) / 1000, **kw)
+    # Too early in the day for roster moves, so this only reads the schedule.
+    tick(at(1, 6) / 1000, **kw)
+    b.cfg = cfg
+    gametime.Schedule(tmp_path / f"gametime-{cfg.league_id}-{cfg.season}.json")
+    _mark_roster_run(tmp_path, cfg)
 
     assert "will retry" in tick((k - 62 * MIN) / 1000, **kw)[0]
     assert "started" in tick((k - 57 * MIN) / 1000, **kw)[0]
@@ -158,3 +177,58 @@ def test_looking_at_the_plan_runs_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(gametime, "_run_hook", lambda s, h: ran.append("agent") or True)
     text = gametime.status((at(4, 13) - 44 * MIN) / 1000)    # inside the lineup window
     assert "Kickoff Sun Oct 4 1:00 PM" in text and ran == []
+
+
+def test_the_agent_is_asked_about_roster_moves_when_the_week_unlocks(tmp_path, monkeypatch):
+    monkeypatch.setattr(gametime, "_alert", lambda e: None)
+    cfg = dataclasses.replace(CFG, state_dir=str(tmp_path), gametime_hook="/bin/true")
+
+    class Rolling(Board):
+        def __init__(self, cfg):
+            super().__init__(cfg, [])
+            self.wk = 3
+
+        def week(self):
+            return self.wk
+
+    b = Rolling(cfg)
+    log: list[str] = []
+    kw = dict(board_fn=lambda: b, run_lineup=lambda: 0,
+              run_agent=lambda slot, hook, event="agent": log.append(event) or True)
+    sep = lambda d, h, m=0: int(datetime(2026, 9, d, h, m, tzinfo=ET).timestamp())  # noqa: E731
+
+    # Monday night: week 3 is over, every game played. Nothing to ask.
+    assert tick(sep(28, 21, 45), **kw) == [] and log == []
+    # Watching for the rollover: re-read every 20 minutes, not every 6 hours.
+    reads = b.reads
+    tick(sep(28, 21, 50), **kw)
+    assert b.reads == reads
+    tick(sep(28, 22, 10), **kw)
+    assert b.reads == reads + 1
+
+    # ESPN rolls over at 4 AM. Seen at once, and held until he is awake.
+    b.wk, b.players = 4, roster()
+    assert tick(sep(29, 4, 0), **kw) == [] and log == []
+    assert "Roster moves: unlocked" in _status(b, sep(29, 4, 1), monkeypatch)
+    assert tick(sep(29, 8, 55), **kw) == []
+    assert tick(sep(29, 9, 0), **kw) == ["roster run for week 4: started (players unlocked)"]
+    assert log == ["roster"]
+    # Once a week, however many ticks follow and however often it re-reads.
+    for hour in (9, 12, 15, 20):
+        tick(sep(29, hour, 30), **kw)
+    tick(sep(30, 10, 0), **kw)
+    assert log == ["roster"]
+
+
+def test_a_failed_roster_run_is_tried_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(gametime, "_alert", lambda e: None)
+    cfg = dataclasses.replace(CFG, state_dir=str(tmp_path), gametime_hook="/bin/true")
+    b = Board(cfg, roster())
+    answers = iter([False, True])
+    log: list[str] = []
+    kw = dict(board_fn=lambda: b, run_lineup=lambda: 0,
+              run_agent=lambda slot, hook, event="agent": log.append(event) or next(answers))
+    sep = lambda d, h, m=0: int(datetime(2026, 9, d, h, m, tzinfo=ET).timestamp())  # noqa: E731
+    assert "will retry" in tick(sep(29, 10, 0), **kw)[0]
+    assert "started" in tick(sep(29, 10, 5), **kw)[0]
+    assert tick(sep(29, 10, 10), **kw) == [] and log == ["roster", "roster"]
