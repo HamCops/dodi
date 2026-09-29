@@ -592,3 +592,18 @@ def test_streaming_compares_my_defense_with_the_best_free_one(tmp_path, monkeypa
     assert got["mine"][0]["opponent_implied_total"] == 13.0
     assert got["mine"][0]["adj_week_proj"] > got["mine"][0]["week_proj"] + 3
     assert got["best_available"] and "upgrade" in got
+
+
+def test_cache_file_names_cannot_leave_the_cache_directory(tmp_path):
+    cache = DiskCache(tmp_path / "cache")
+    for key in ("place-../../etc/passwd", "place-/abs/olute", "..", "forecast-a b\\c-2026",
+                "place-" + "x" * 500, ""):
+        path = cache._path(key)
+        assert path.parent == tmp_path / "cache", key
+        assert "/" not in path.name and not path.name.startswith("."), key
+        assert cache.get(key, 60, lambda: {"ok": 1}) == {"ok": 1}
+    assert {p.parent for p in (tmp_path / "cache").iterdir()} == {tmp_path / "cache"}
+    assert not (tmp_path / "etc").exists()
+    # Ordinary keys keep the names they had, so nothing cached is orphaned.
+    assert cache._path("sleeper-players-v2").name == "sleeper-players-v2.json"
+    assert cache._path("fantasycalc-10t-0.0ppr-1qb").name == "fantasycalc-10t-0.0ppr-1qb.json"

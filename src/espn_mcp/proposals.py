@@ -176,12 +176,15 @@ class ProposalStore:
 
     def authorized(self, pid: str, token: str | None) -> dict | None:
         """The proposal, if the token is the one issued for it."""
+        # As bytes: compare_digest refuses text that is not ASCII, and what
+        # arrives here is whatever a client chose to send.
+        given = (token or "").encode("utf-8", "replace")
         p = self.get(pid)
         if p is None or not token:
             # Compare anyway so a wrong id and a wrong token cost the same.
-            hmac.compare_digest(token or "", secrets.token_urlsafe(32))
+            hmac.compare_digest(given, secrets.token_urlsafe(32).encode())
             return None
-        return p if hmac.compare_digest(token, p["token"]) else None
+        return p if hmac.compare_digest(given, p["token"].encode()) else None
 
     def decide(self, pid: str, decision: str, now: float | None = None) -> dict:
         """Move a pending proposal to approved or rejected, exactly once.

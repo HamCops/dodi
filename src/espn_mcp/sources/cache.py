@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -27,7 +28,10 @@ class DiskCache:
         self.status: dict[str, dict[str, Any]] = {}
 
     def _path(self, key: str) -> Path:
-        return self.root / f"{key}.json"
+        # Keys can carry text from outside (a venue's city). A file name is
+        # made only of characters that cannot leave the cache directory.
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", key).lstrip(".") or "_"
+        return self.root / f"{name[:150]}.json"
 
     def _read(self, key: str) -> tuple[float, Any] | None:
         path = self._path(key)

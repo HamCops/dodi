@@ -482,3 +482,50 @@ def test_approving_a_start_the_lineup_already_made_still_keeps_it(league, monkey
     assert len(b.client.writes) == writes and pushes[-1]["title"] == "Dodi: done"
     assert _tool("set_lineup")["manager_decisions"] == [
         f"start {up['name']} over {sit['name']}"]
+
+
+# --- stored moves name players by id ------------------------------------------
+
+
+def test_a_queued_move_is_stored_by_player_id_and_replayed_by_it(league):
+    import espn_mcp.server as srv
+
+    b, _ = league
+    free = b.season_available()[0]
+    fragment = free["name"].split()[-1]            # how an agent might name him
+    out = _tool("request_approval", action="add_player", params={"add": free["name"]},
+                reasoning="x")
+    stored = srv.proposal_store().get(out["proposal"]["id"])
+    assert stored["params"] == {"add": f"id:{free['player_id']}"}
+    assert free["name"] in stored["summary"]
+    # Asked for again under another spelling, it is the same move.
+    same = _tool("request_approval", action="add_player",
+                 params={"add": free["name"].upper()}, reasoning="x")
+    assert same["queued"] is False and same["already"] == "pending"
+    assert fragment
+
+    with _client() as c:
+        c.post(f"/p/{stored['id']}/approve",
+               headers={"Authorization": f"Bearer {stored['token']}"})
+    assert srv.proposal_store().get(stored["id"])["status"] == "applied"
+    assert b.client.posts[0]["items"][0]["playerId"] == free["player_id"]
+
+
+def test_an_id_reference_matches_that_player_only(league):
+    import espn_mcp.server as srv
+
+    b, _ = league
+    mine = b.team_players(CFG.team_id)
+    found, problems = srv._resolve([f"id:{mine[0]['player_id']}"], mine, "your roster")
+    assert found == [mine[0]] and problems == []
+    found, problems = srv._resolve(["id:999999999"], mine, "your roster")
+    assert found == [] and problems[0]["problem"] == "not on your roster"
+    # A number inside a name is still a name.
+    assert srv._resolve(["id:12 extra"], mine, "your roster")[1]
+
+
+def test_a_token_that_is_not_ascii_is_simply_wrong(store):
+    p = make(store)
+    assert store.authorized(p["id"], "t\u00f6ken\u2603") is None
+    assert store.authorized("nope", "\u2603") is None
+    assert store.authorized(p["id"], p["token"])["id"] == p["id"]

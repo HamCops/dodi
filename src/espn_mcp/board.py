@@ -596,6 +596,7 @@ class DraftBoard:
         if not team:
             return []
         out = []
+        off_board = []
         for e in team["entries"]:
             p = board["by_id"].get(e["player_id"])
             if p is None and e["player"] is not None:
@@ -606,7 +607,15 @@ class DraftBoard:
                 p["tier"] = None
                 p["value_basis"] = "vorp" if base is not None else "espn_adp"
                 p["late_round_position"] = p["position"] in ("K", "D/ST")
-                self._attach_signals([p], shape, week, board["players"] + [p])
+                off_board.append(p)
+        if off_board:
+            # Once for the roster, not once a player: the join is over the
+            # whole player directory each time.
+            self._attach_signals(off_board, shape, week, board["players"] + off_board)
+        for e in team["entries"]:
+            p = board["by_id"].get(e["player_id"])
+            if p is None:
+                p = e["player"]
             if p is None:
                 continue
             rec = dict(p)

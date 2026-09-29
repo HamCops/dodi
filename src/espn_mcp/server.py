@@ -950,10 +950,26 @@ def _team_brief(t: dict) -> dict:
             "points_for": t["points_for"]}
 
 
+def player_ref(player_id: int) -> str:
+    """How a stored proposal names a player: by id, which cannot be ambiguous
+    and does not change when a roster does."""
+    return f"id:{int(player_id)}"
+
+
 def _resolve(names: list[str], players: list[dict], label: str) -> tuple[list[dict], list[dict]]:
-    """Match names against a roster. Returns (matched, problems)."""
+    """Match names, or `id:<player id>` references, against a roster.
+    Returns (matched, problems)."""
+    import re
     found, problems = [], []
     for name in names:
+        ref = re.fullmatch(r"id:(-?\d+)", str(name).strip())
+        if ref:
+            hit = next((p for p in players if p["player_id"] == int(ref.group(1))), None)
+            if hit is None:
+                problems.append({"name": name, "problem": f"not on {label}"})
+            else:
+                found.append(hit)
+            continue
         q = name.lower().strip()
         hits = [p for p in players if q in (p["name"] or "").lower()]
         exact = [p for p in hits if p["name"].lower() == q]
@@ -2353,6 +2369,30 @@ def _describe_move(action: str, params: dict, preview: dict) -> tuple[str, str]:
     return f"Dodi: {preview['action']} trade?", body
 
 
+def _by_id(action: str, params: dict, preview: dict) -> dict:
+    """The same move with every player named by id, taken from its preview.
+
+    What the manager approves is the summary built from this preview. Storing
+    ids means the move replayed on approval is that move and no other, even
+    if a name that was unique when it was queued no longer is.
+    """
+    if action == "add_player":
+        out = {"add": player_ref(preview["add"]["id"])}
+        if preview["drop"]:
+            out["drop"] = player_ref(preview["drop"][0]["id"])
+        return out
+    if action == "drop_player":
+        return {"player": player_ref(preview["drop"]["id"])}
+    if action == "propose_trade":
+        return {"give": [player_ref(p["id"]) for p in preview["give"]],
+                "receive": [player_ref(p["id"]) for p in preview["receive"]],
+                "partner_team_id": int(preview["partner"]["team_id"])}
+    if action == "start_player":
+        return {"player": player_ref(preview["start"]["id"]),
+                "over": player_ref(preview["sit"]["id"])}
+    return params     # respond_to_trade names a trade, by its own id
+
+
 def _expiry(action: str, preview: dict) -> float | None:
     """When the move stops being possible, if sooner than the default."""
     if action == "add_player" and preview.get("waivers_clear_ms"):
@@ -2415,15 +2455,16 @@ def request_approval(action: str, params: dict, reasoning: str) -> dict:
     except ProposalError as exc:
         return {"queued": False, "error": str(exc)}
     store = proposal_store()
+    preview = _writers()[action](**params, apply=False)
+    if "error" in preview:
+        return {"queued": False, "error": preview["error"], "preview": preview}
+    params = _by_id(action, params, preview)
     blocking = store.find_blocking(action, params)
     if blocking:
         return {"queued": False, "already": blocking["status"],
                 "proposal": public(blocking),
                 "note": ("Rejected recently; do not ask again." if blocking["status"] == "rejected"
                          else "Already waiting on the manager.")}
-    preview = _writers()[action](**params, apply=False)
-    if "error" in preview:
-        return {"queued": False, "error": preview["error"], "preview": preview}
     title, summary = _describe_move(action, params, preview)
     try:
         proposal = store.create(action, params, title=title, summary=summary,

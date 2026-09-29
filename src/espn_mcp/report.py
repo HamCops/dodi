@@ -83,6 +83,7 @@ def decisions(b: DraftBoard, week: int, since: float, until: float) -> list[dict
                for p in b.team_players(tid, week)}
     by_name.update({p["name"]: p for p in b.season_board(week)["players"]
                     if p["name"] not in by_name})
+    by_ref = {f"id:{p['player_id']}": p["name"] for p in by_name.values()}
     pts = lambda name: (by_name.get(name, {}).get("week_points") or {}).get(week)  # noqa: E731
     out = []
     for p in proposal_store().list(limit=100):
@@ -90,20 +91,22 @@ def decisions(b: DraftBoard, week: int, since: float, until: float) -> list[dict
             continue
         row = {"what": p["title"].removeprefix("Dodi: ").rstrip("?"), "status": p["status"]}
         if p["action"] == "start_player":
-            a, c = pts(_full(by_name, p["params"]["player"])), pts(_full(by_name, p["params"]["over"]))
+            a, c = pts(_full(by_name, p["params"]["player"], by_ref)), pts(_full(by_name, p["params"]["over"], by_ref))
             if a is not None and c is not None:
                 took = p["status"] == "applied"
                 row["outcome"] = (f"{a} vs {c}: " + (
                     "right call" if (a >= c) == took else "wrong call"))
         elif p["action"] == "add_player" and p["params"].get("drop"):
-            a, c = pts(_full(by_name, p["params"]["add"])), pts(_full(by_name, p["params"]["drop"]))
+            a, c = pts(_full(by_name, p["params"]["add"], by_ref)), pts(_full(by_name, p["params"]["drop"], by_ref))
             if a is not None and c is not None:
                 row["outcome"] = f"added player scored {a}, dropped player {c} (one week)"
         out.append(row)
     return out
 
 
-def _full(by_name: dict, fragment: str) -> str:
+def _full(by_name: dict, fragment: str, by_ref: dict | None = None) -> str:
+    if by_ref and fragment in by_ref:
+        return by_ref[fragment]
     hits = [n for n in by_name if fragment.lower() in n.lower()]
     return hits[0] if len(hits) == 1 else fragment
 
