@@ -19,6 +19,7 @@ from .constants import SLOT_BY_ID
 from .espn import ESPNClient, ESPNError
 from .scoring import LeagueShape, normalize_player, parse_settings
 from .season import attach_ros
+from .sources import Signals, build_signals
 from .value import build_value_board, value_vs_adp
 
 # ESPN marks an undrafted schedule slot with this player id. Real player ids
@@ -34,9 +35,11 @@ def _live_first(side: dict, key: str):
 
 
 class DraftBoard:
-    def __init__(self, cfg: Config, client: ESPNClient | None = None) -> None:
+    def __init__(self, cfg: Config, client: ESPNClient | None = None,
+                 signals: Signals | None = None) -> None:
         self.cfg = cfg
         self.client = client or ESPNClient(cfg)
+        self.signals = signals if signals is not None else build_signals(cfg)
         self._lock = threading.Lock()
         self._shape: LeagueShape | None = None
         self._shape_at: float = 0.0
@@ -483,6 +486,19 @@ class DraftBoard:
                 p["nfl_opponent"] = "BYE" if team else None
         attach_ros(players, shape.current_week, shape.final_week, week=week)
 
+    def _attach_signals(self, players: list[dict], shape: LeagueShape, week: int,
+                        rank_pool: list[dict] | None = None) -> None:
+        """Outside data, when enabled. Never allowed to fail a read of ESPN."""
+        if self.signals is None:
+            return
+        try:
+            self.signals.attach(players, shape, week, rank_pool)
+            self.signals.cache.status.pop("outside_data", None)
+        except Exception as exc:  # noqa: BLE001
+            # ESPN's numbers stand on their own; say that the rest is missing.
+            self.signals.cache.status["outside_data"] = {
+                "ok": False, "error": f"could not be joined: {type(exc).__name__}: {exc}"}
+
     def season_board(self, week: int | None = None, refresh: bool = False) -> dict:
         """The player pool valued over rest-of-season, with one week's projection.
 
@@ -501,6 +517,7 @@ class DraftBoard:
         players = [p for p in players if p["position"] in ("QB", "RB", "WR", "TE", "K", "D/ST")]
         self._enrich_for_week(players, week)
         board = build_value_board(players, shape, key="ros_points")
+        self._attach_signals(board["players"], shape, week)
         board["week"] = week
         board["by_id"] = {p["player_id"]: p for p in board["players"]}
         with self._lock:
@@ -589,6 +606,7 @@ class DraftBoard:
                 p["tier"] = None
                 p["value_basis"] = "vorp" if base is not None else "espn_adp"
                 p["late_round_position"] = p["position"] in ("K", "D/ST")
+                self._attach_signals([p], shape, week, board["players"] + [p])
             if p is None:
                 continue
             rec = dict(p)

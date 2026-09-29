@@ -1037,3 +1037,36 @@ def test_get_transactions_hides_draft_filters_and_names_players():
 
     with_draft = call("get_transactions", include_draft=True, limit=1)
     assert with_draft["shown"] == 1 and with_draft["total"] == 3
+
+
+def test_a_proposal_is_open_only_until_something_answers_it_or_it_expires():
+    """ESPN leaves the original proposal PENDING forever; the decline, accept
+    or cancellation is its own record pointing back at it."""
+    from espn_mcp.server import open_trade_proposals
+
+    me, now = 12, 2_000
+
+    def proposal(tid, team=12, partner=6, **kw):
+        return {"id": tid, "type": "TRADE_PROPOSAL", "status": "PENDING", "teamId": team,
+                "items": [{"type": "TRADE", "playerId": 1, "fromTeamId": team,
+                           "toTeamId": partner}], **kw}
+
+    txs = [
+        proposal("open", expirationDate=3_000),
+        proposal("no-expiry"),
+        proposal("expired", expirationDate=1_999),
+        proposal("declined", expirationDate=3_000),
+        {"id": "x1", "type": "TRADE_DECLINE", "status": "EXECUTED", "teamId": 6,
+         "relatedTransactionId": "declined", "items": []},
+        proposal("withdrawn", expirationDate=3_000),
+        # The cancellation is itself a TRADE_PROPOSAL, sometimes still PENDING-shaped.
+        {**proposal("x2", expirationDate=3_000), "status": "CANCELED",
+         "executionType": "CANCEL", "relatedTransactionId": "withdrawn"},
+        {**proposal("x3", expirationDate=3_000), "executionType": "CANCEL",
+         "relatedTransactionId": "withdrawn"},
+        proposal("accepted", team=6, partner=12, expirationDate=3_000),
+        {"id": "x4", "type": "TRADE_ACCEPT", "status": "EXECUTED", "teamId": 12,
+         "relatedTransactionId": "accepted", "items": []},
+        proposal("not-mine", team=3, partner=4, expirationDate=3_000),
+    ]
+    assert [t["id"] for t in open_trade_proposals(txs, me, now)] == ["open", "no-expiry"]

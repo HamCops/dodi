@@ -45,6 +45,27 @@ class Config:
     swid: str | None
     pool_ttl: int
     state_dir: str | None
+    # Approval queue. With require_approval, roster moves and trades are only
+    # sent to ESPN through an approved proposal; lineup changes stay direct.
+    require_approval: bool = False
+    ntfy_url: str | None = None
+    ntfy_topic: str | None = None
+    ntfy_token: str | None = None
+    approve_base_url: str | None = None
+    approve_port: int = 6075
+    # Read Sleeper and FantasyCalc for trade values, pickup trends and a
+    # second projection. Off unless asked for: it calls third parties.
+    external_sources: bool = False
+    # The manager's clock: how long he wants to decide in, where he is, and
+    # what to call when it is time for the agent to look (see gametime.py).
+    approval_lead_minutes: int = 30
+    timezone: str = "America/New_York"
+    gametime_hook: str | None = None
+
+    @property
+    def state_root(self) -> Path:
+        return (Path(self.state_dir) if self.state_dir
+                else Path(__file__).resolve().parents[2] / "state")
 
     @property
     def has_auth(self) -> bool:
@@ -53,13 +74,17 @@ class Config:
     @property
     def secrets(self) -> tuple[str, ...]:
         """Values that must never appear in output; used to scrub error text."""
-        return tuple(v for v in (self.espn_s2, self.swid) if v)
+        return tuple(v for v in (self.espn_s2, self.swid, self.ntfy_token) if v)
 
     def __repr__(self) -> str:
         return (f"Config(league_id={self.league_id!r}, season={self.season!r}, "
                 f"team_id={self.team_id!r}, espn_s2={mask(self.espn_s2)!r}, "
                 f"swid={mask(self.swid)!r}, pool_ttl={self.pool_ttl!r}, "
                 f"state_dir={self.state_dir!r})")
+
+
+def _flag(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_config() -> Config:
@@ -84,4 +109,14 @@ def load_config() -> Config:
         swid=swid,
         pool_ttl=int(os.environ.get("ESPN_POOL_TTL", "900")),
         state_dir=os.environ.get("ESPN_STATE_DIR") or None,
+        require_approval=_flag(os.environ.get("ESPN_REQUIRE_APPROVAL")),
+        ntfy_url=os.environ.get("NTFY_URL", "").strip() or None,
+        ntfy_topic=os.environ.get("NTFY_TOPIC", "").strip() or None,
+        ntfy_token=os.environ.get("NTFY_TOKEN", "").strip() or None,
+        approve_base_url=os.environ.get("APPROVE_BASE_URL", "").strip() or None,
+        approve_port=int(os.environ.get("APPROVE_PORT", "6075")),
+        external_sources=_flag(os.environ.get("ESPN_EXTERNAL_SOURCES")),
+        approval_lead_minutes=int(os.environ.get("APPROVAL_LEAD_MINUTES", "30")),
+        timezone=os.environ.get("ESPN_TIMEZONE", "").strip() or "America/New_York",
+        gametime_hook=os.environ.get("GAMETIME_HOOK", "").strip() or None,
     )

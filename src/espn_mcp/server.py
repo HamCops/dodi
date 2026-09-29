@@ -8,6 +8,7 @@ to the model reasoning over these tools.
 
 from __future__ import annotations
 
+import contextvars
 import functools
 from typing import Any
 
@@ -18,11 +19,17 @@ from .board import DraftBoard
 from .constants import SLOT_BY_ID
 from .config import Config, load_config
 from .espn import ESPNError
+from .market import acceptable, trade_view
+from .notify import deadline, push_proposal
+from .proposals import ProposalError, ProposalStore, clean_params, public
 from .scoring import LeagueShape
+from .sources.signals import market_view
 from .season import (
     ROS_KEY,
     SLOT_ID_BY_NAME,
+    START_KEY,
     WEEK_KEY,
+    close_calls,
     current_starters,
     describe_transaction,
     drop_candidates,
@@ -35,6 +42,7 @@ from .season import (
     plan_move,
     roster_profile,
     waiver_gain,
+    with_start_proj,
 )
 
 mcp = MCPServer(
@@ -55,7 +63,10 @@ mcp = MCPServer(
         "the drop), drop_player. TRADES: propose_trade sends an offer, get_pending_trades "
         "lists offers waiting on either side, respond_to_trade accepts, declines or "
         "withdraws one. Every writing tool previews by default and only touches ESPN "
-        "with apply=true; confirm with the user before applying. Rankings are by VORP (value over replacement), which already "
+        "with apply=true; confirm with the user before applying. APPROVAL: when a "
+        "roster move or trade is refused because it needs approval, queue it with "
+        "request_approval; the manager approves it from a notification and it is "
+        "sent then. get_proposals shows what is waiting and what was decided. Rankings are by VORP (value over replacement), which already "
         "accounts for positional scarcity in this league's specific lineup; do not "
         "re-rank by raw projected points. In season, VORP is over rest-of-season "
         "points; week_proj is ESPN's single-week projection and already reflects "
@@ -814,7 +825,117 @@ def _slim_season(p: dict) -> dict:
         out["on_trade_block"] = True
     if p.get("value_basis") != "vorp":
         out["ranked_by"] = "week_proj"  # no ROS projection (D/ST)
+    out.update(_outside(p))
     return out
+
+
+def _outside(p: dict) -> dict:
+    """What the sources beyond ESPN say about a player, when they say anything."""
+    out: dict[str, Any] = {}
+    if p.get("market_value") is not None:
+        out["market"] = {"value": p["market_value"], "pos_rank": p.get("market_pos_rank"),
+                         "model_pos_rank": p.get("model_pos_rank")}
+        if p.get("market_trend_30d"):
+            out["market"]["trend_30d"] = p["market_trend_30d"]
+        if (view := market_view(p)):
+            out["market"]["view"] = view
+    if p.get("usage"):
+        out["usage"] = {k: v for k, v in p["usage"].items() if k != "per_game"}
+    for key in ("adj_week_proj", "game", "adds_24h", "drops_24h", "alt_week_proj",
+                "practice", "injury_alt"):
+        if p.get(key) is not None:
+            out[key] = p[key]
+    return out
+
+
+def _usage_view(give: list[dict], receive: list[dict]) -> dict | None:
+    """A trade by workload: whose scoring is likely to hold up."""
+    rows = [p for p in give + receive if p.get("usage")]
+    if not rows:
+        return None
+    side = lambda ps: [  # noqa: E731
+        {"name": p["name"], "ppg": p["usage"]["ppg"],
+         "outlook_ppg": p["usage"]["outlook_ppg"], "view": p["usage"].get("view")}
+        for p in ps if p.get("usage")]
+    total = lambda ps, key: round(sum(p["usage"][key] for p in ps if p.get("usage")), 2)  # noqa: E731
+    out = {
+        "give": side(give), "receive": side(receive),
+        "ppg_so_far": {"give": total(give, "ppg"), "receive": total(receive, "ppg")},
+        "outlook_ppg": {"give": total(give, "outlook_ppg"),
+                        "receive": total(receive, "outlook_ppg")},
+    }
+    out["outlook_change"] = round(out["outlook_ppg"]["receive"] - out["outlook_ppg"]["give"], 2)
+    hot = [p["name"] for p in receive if (p.get("usage") or {}).get("view") == "running hot"]
+    cold = [p["name"] for p in give if (p.get("usage") or {}).get("view") == "running cold"]
+    if hot:
+        out["warning"] = (f"Buying high: {', '.join(hot)} is scoring well above his "
+                          "workload. Players like that fell 2 to 4 points a game.")
+    elif cold:
+        out["warning"] = (f"Selling low: {', '.join(cold)} is scoring well below his "
+                          "workload. Players like that rose about 2 points a game.")
+    return out
+
+
+def _streaming(mine: list[dict], available: list[dict], now_ms: int) -> dict:
+    """Defense and kicker for this week: what I have against what is free."""
+    from .season import is_locked
+
+    score = lambda p: p.get("adj_week_proj") if p.get("adj_week_proj") is not None \
+        else (p.get(WEEK_KEY) or 0.0)  # noqa: E731
+
+    def row(p: dict) -> dict:
+        out = {"name": p["name"], "team": p["pro_team"], "opp": p.get("nfl_opponent"),
+               "week_proj": p.get(WEEK_KEY), "adj_week_proj": p.get("adj_week_proj")}
+        game = p.get("game") or {}
+        for k in ("opponent_implied_total", "implied_total", "indoor", "wind_mph"):
+            if game.get(k) is not None:
+                out[k] = game[k]
+        if p.get("roster_status"):
+            out["status"] = p["roster_status"]
+        return out
+
+    out = {}
+    for pos in ("D/ST", "K"):
+        held = sorted((p for p in mine if p["position"] == pos), key=lambda p: -score(p))
+        free = sorted((p for p in available if p["position"] == pos
+                       and not is_locked(p, now_ms) and score(p) > 0),
+                      key=lambda p: -score(p))[:3]
+        best = held[0] if held else None
+        entry = {"mine": [row(p) for p in held], "hold_count": len(held),
+                 "best_available": [row(p) for p in free]}
+        if free:
+            entry["upgrade"] = round(score(free[0]) - (score(best) if best else 0.0), 2)
+        out[pos] = entry
+    return out
+
+
+def _sources(b: DraftBoard) -> dict | None:
+    return b.signals.status() if b.signals is not None else None
+
+
+_OUTSIDE_NOTE = (
+    "market is the player's trade value from real trades (FantasyCalc): pos_rank is "
+    "the market's rank at the position, model_pos_rank is this league's rest-of-season "
+    "projection rank, and view is 'sell' when the market rates him well above his "
+    "projection and 'buy' when well below. adds_24h/drops_24h are pickups and cuts "
+    "across Sleeper leagues in the last day. alt_week_proj is Sleeper's projection "
+    "for the week; a large gap from week_proj means the two disagree, not that either "
+    "is right. injury_alt is Sleeper's injury designation where it differs from "
+    "ESPN's, with its age and the game it is about: a second report to check, not a "
+    "correction. When about is 'next game' this week's game has already kicked off "
+    "and the report says nothing about it. game is the player's NFL game: "
+    "implied_total is the points the betting market expects his team to score, and "
+    "wind_mph/rain_pct/temp_f are the forecast at kickoff for outdoor games. "
+    "adj_week_proj is week_proj moved by the implied total; set_lineup uses it. "
+    "Wind and rain are shown for judgement only: over two seasons they did not "
+    "reliably improve on ESPN's projection, which already accounts for them. "
+    "usage is the player's season against his workload: ppg is what he scores, "
+    "expected_ppg is what his carries and targets say he should, gap is the "
+    "difference, outlook_ppg is the rest-of-season estimate from both. view is "
+    "'running hot' (scoring 3+ a game above his workload) or 'running cold' (3+ "
+    "below). Over two seasons hot players fell 2 to 4 points a game afterwards "
+    "and cold ones rose about 2: sell hot, buy cold."
+)
 
 
 def _record(t: dict) -> str:
@@ -999,14 +1120,33 @@ def set_lineup(week: int | None = None, apply: bool = False) -> dict:
     players = b.team_players(me, week)
     if not players:
         return {"error": f"No roster found for team {me} in week {week}."}
-    plan = plan_lineup(players, shape, WEEK_KEY, now_ms=_now_ms())
+    # The manager's own start/sit decisions outrank the projection.
+    # ...unless the player he chose to start can no longer play: a decision
+    # made on Thursday must not start a man ruled out on Sunday.
+    by_id = {p["player_id"]: p for p in players}
+    pins, dropped = [], []
+    for x in _pins(b, week):
+        chosen = by_id.get(x["start"])
+        if chosen is None or x["sit"] not in by_id or _cannot_play(chosen):
+            dropped.append(x)
+        else:
+            pins.append(x)
+    start_ids = {x["start"] for x in pins}
+    sit_ids = {x["sit"] for x in pins}
+    scored = [{**p, "_start": (p.get(START_KEY) or 0.0)
+               + (1000 if p["player_id"] in start_ids else 0)
+               - (1000 if p["player_id"] in sit_ids else 0)}
+              for p in with_start_proj(players)]
+    plan = plan_lineup(scored, shape, "_start", now_ms=_now_ms())
+    before = round(sum(p.get(WEEK_KEY) or 0.0 for p in current_starters(players)), 2)
+    after = round(sum(p.get(WEEK_KEY) or 0.0 for _, p in plan["starters"]), 2)
     out: dict[str, Any] = {
         "week": week,
         "applied": False,
         "moves": [_move_row(m) for m in plan["moves"]],
-        "set_total": plan["total_before"],
-        "optimal_total": plan["total_after"],
-        "gain": plan["gain"],
+        "set_total": before,
+        "optimal_total": after,
+        "gain": round(after - before, 2),
         "starters_after": [
             {**_slim_season(p), "slot": SLOT_BY_ID.get(sid, str(sid))}
             for sid, p in plan["starters"]
@@ -1016,6 +1156,34 @@ def set_lineup(week: int | None = None, apply: bool = False) -> dict:
         "questionable": [f"{p['name']} is {p['injury_status']}" for _, p in plan["starters"]
                          if p.get("injury_status") == "QUESTIONABLE"],
     }
+    if any(p.get("adj_week_proj") is not None for p in players):
+        out["set_by"] = (
+            "adj_week_proj: ESPN's projection nudged by the betting line (a team "
+            "expected to score more than the week's average moves its players up, "
+            "by at most a point or so). Totals here are ESPN's own numbers, so they "
+            "match the app.")
+    if dropped:
+        out["decisions_set_aside"] = [
+            f"start {x['start_name']} over {x['sit_name']}: {x['start_name']} "
+            "is out or no longer on the roster" for x in dropped]
+    if pins:
+        out["manager_decisions"] = [f"start {x['start_name']} over {x['sit_name']}"
+                                    for x in pins]
+    # Judge close calls on the lineup as it will stand after these moves.
+    final_slot = {m["player_id"]: m["to_slot_id"] for m in plan["moves"]}
+    standing = [{**p, "slot_id": final_slot.get(p["player_id"], p.get("slot_id"))}
+                for p in with_start_proj(players)]
+    calls = [c for c in close_calls(standing, shape, START_KEY, now_ms=_now_ms())
+             if c["start"]["player_id"] not in sit_ids
+             and c["sit"]["player_id"] not in start_ids]
+    if calls:
+        out["close_calls"] = [_close_call_row(c) for c in calls]
+        out["close_calls_note"] = (
+            "A benched player within half a point of a starter this week who is "
+            "clearly the better player over the season or by trade value. The "
+            "projection cannot separate them, and over two seasons neither could "
+            "reputation: these came out even. It is the manager's preference. Queue with "
+            "request_approval('start_player', {'player': ..., 'over': ...}, reasoning).")
     if not plan["moves"]:
         out["note"] = "The set lineup is already the best one; nothing to do."
         return out
@@ -1029,6 +1197,124 @@ def set_lineup(week: int | None = None, apply: bool = False) -> dict:
     out["transaction_id"] = result.get("id")
     if not synced:
         out["note"] = _LAG_NOTE
+    return out
+
+
+def _cannot_play(p: dict) -> bool:
+    from .season import NOT_PLAYING
+    return ((p.get("injury_status") or "").upper() in NOT_PLAYING
+            or bool(p.get("on_bye")) or p.get("nfl_opponent") == "BYE"
+            or not (p.get(WEEK_KEY) or 0) > 0)
+
+
+def _close_call_row(c: dict) -> dict:
+    return {"start": c["start"]["name"], "over": c["sit"]["name"], "slot": c["slot"],
+            "week_proj": [c["start"].get(WEEK_KEY), c["sit"].get(WEEK_KEY)],
+            "start_proj": [c["start"].get(START_KEY), c["sit"].get(START_KEY)],
+            "reasons": c["reasons"]}
+
+
+def _pins_path(b: DraftBoard):
+    return b.cfg.state_root / f"pins-{b.cfg.league_id}-{b.cfg.season}.json"
+
+
+def _pins(b: DraftBoard, week: int) -> list[dict]:
+    """The manager's approved start/sit decisions for a week."""
+    import json
+    try:
+        return json.loads(_pins_path(b).read_text()).get(str(week), [])
+    except (OSError, ValueError):
+        return []
+
+
+def _add_pin(b: DraftBoard, week: int, start: dict, sit: dict) -> None:
+    import json
+    path = _pins_path(b)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    ids = (start["player_id"], sit["player_id"])
+    # A new decision about either player replaces the old one.
+    rows = [x for x in data.get(str(week), [])
+            if x["start"] not in ids and x["sit"] not in ids]
+    rows.append({"start": start["player_id"], "sit": sit["player_id"],
+                 "start_name": start["name"], "sit_name": sit["name"]})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({str(week): rows}))  # only the current week matters
+
+
+@handle_errors
+def start_player(player: str, over: str, apply: bool = False) -> dict:
+    """Start one player in place of another, and keep it that way.
+
+    Not a tool: reached through request_approval('start_player', ...), so it
+    is the manager's decision. Once applied, set_lineup leaves the pair
+    alone for the rest of the week.
+    """
+    ctx = _my_context()
+    if isinstance(ctx, dict):
+        return ctx
+    b, shape, me, week, mine = ctx
+    found, problems = _resolve([player, over], mine, "your roster")
+    if problems:
+        return {"error": problems[0]["problem"], **problems[0]}
+    up, down = found
+    if up["player_id"] == down["player_id"]:
+        return {"error": "Those are the same player."}
+    for p in (up, down):
+        if is_locked_now(p):
+            return {"error": f"{p['name']} is locked: his game has started."}
+    slot = SLOT_BY_ID.get(down["slot_id"], str(down["slot_id"]))
+    if up["slot_id"] not in (20, 21) and down["slot_id"] == 20:
+        # The lineup got there on its own since this was asked. The decision
+        # still stands, and is kept so that it cannot drift back.
+        out = {"week": week, "applied": bool(apply), "start": _slim_season(up),
+               "sit": _slim_season(down), "moves": [],
+               "slot": SLOT_BY_ID.get(up["slot_id"], str(up["slot_id"])),
+               "week_proj_change": 0.0,
+               "kickoff_ms": min((k for k in (up.get("kickoff_ms"), down.get("kickoff_ms"))
+                                  if k), default=None),
+               "note": f"{up['name']} is already starting and {down['name']} is on the "
+                       "bench."}
+        if apply:
+            _add_pin(b, week, up, down)
+            out["note"] += " Kept that way for the rest of the week."
+        return out
+    if down["slot_id"] in (20, 21):
+        return {"error": f"{down['name']} is not starting."}
+    if up["slot_id"] not in (20,):
+        return {"error": f"{up['name']} is not on the bench (he is in "
+                         f"{SLOT_BY_ID.get(up['slot_id'], up['slot_id'])})."}
+    if slot not in (up.get("eligible_slots") or []):
+        return {"error": f"{up['name']} ({up['position']}) cannot play {slot}."}
+    moves = [
+        {"player_id": up["player_id"], "name": up["name"], "from_slot_id": up["slot_id"],
+         "to_slot_id": down["slot_id"], "from_slot": "BE", "to_slot": slot},
+        {"player_id": down["player_id"], "name": down["name"],
+         "from_slot_id": down["slot_id"], "to_slot_id": 20, "from_slot": slot,
+         "to_slot": "BE"},
+    ]
+    out: dict[str, Any] = {
+        "week": week, "applied": False, "slot": slot,
+        "start": _slim_season(up), "sit": _slim_season(down),
+        "week_proj_change": round((up.get(WEEK_KEY) or 0) - (down.get(WEEK_KEY) or 0), 2),
+        "kickoff_ms": min(k for k in (up.get("kickoff_ms"), down.get("kickoff_ms")) if k)
+        if (up.get("kickoff_ms") or down.get("kickoff_ms")) else None,
+        "moves": [_move_row(m) for m in moves],
+    }
+    if not apply:
+        out["note"] = "Preview only."
+        return out
+    result = b.client.set_lineup(me, week, moves)
+    _add_pin(b, week, up, down)
+    synced = _after_write(b, week, _expect_slots(me, moves))
+    out["applied"] = True
+    out["espn_status"] = result.get("status")
+    out["transaction_id"] = result.get("id")
+    out["note"] = (_LAG_NOTE if not synced else
+                   f"{up['name']} starts at {slot}; the lineup optimizer will leave "
+                   "this alone for the rest of the week.")
     return out
 
 
@@ -1158,6 +1444,24 @@ def _expect_roster(team_id: int, present=(), absent=()):
     return check
 
 
+# Set only while an approved proposal is being replayed. It is the one way
+# past the approval gate, and nothing a tool caller passes can set it.
+_approved_call: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "approved_call", default=False)
+
+
+def _approval_gate(apply: bool) -> dict | None:
+    """Refuse a direct write when the league is run on approvals."""
+    if not apply or _approved_call.get() or not board().cfg.require_approval:
+        return None
+    return {
+        "error": "This move needs the manager's approval and was not sent.",
+        "applied": False,
+        "recoverable": True,
+        "hint": "Queue it with request_approval(action, params, reasoning).",
+    }
+
+
 _LAG_NOTE = "ESPN accepted the change but its reads have not caught up yet; re-read in a moment."
 
 
@@ -1180,6 +1484,8 @@ def add_player(add: str, drop: str | None = None, apply: bool = False,
         apply: submit to ESPN. False previews.
         bid: FAAB bid for a waiver claim, in leagues that use a budget.
     """
+    if (gate := _approval_gate(apply)):
+        return gate
     ctx = _my_context()
     if isinstance(ctx, dict):
         return ctx
@@ -1209,6 +1515,10 @@ def add_player(add: str, drop: str | None = None, apply: bool = False,
     }
     if waiver and target.get("waiver_clears_ms"):
         out["waivers_clear"] = _local_time(target["waiver_clears_ms"], "%a %b %d %I:%M %p")
+        out["waivers_clear_ms"] = target["waiver_clears_ms"]
+    elif target.get("kickoff_ms") and not is_locked_now(target):
+        # A free agent is only any use this week if he is added before his game.
+        out["add_kickoff_ms"] = target["kickoff_ms"]
     if shape.waivers.get("uses_faab"):
         out["bid"] = bid or 0
     if res["must_drop"]:
@@ -1256,6 +1566,8 @@ def drop_player(player: str, apply: bool = False) -> dict:
         player: name, or a unique part of it.
         apply: submit to ESPN. False previews.
     """
+    if (gate := _approval_gate(apply)):
+        return gate
     ctx = _my_context()
     if isinstance(ctx, dict):
         return ctx
@@ -1306,6 +1618,8 @@ def propose_trade(give: list[str], receive: list[str],
         partner_team_id: the other team. Inferred from `receive` if omitted.
         apply: post the offer. False previews.
     """
+    if (gate := _approval_gate(apply)):
+        return gate
     ev = analyze_trade(give, receive, partner_team_id)
     if "error" in ev:
         return ev
@@ -1337,16 +1651,36 @@ def propose_trade(give: list[str], receive: list[str],
 PENDING_TRADE_STATUSES = {"PENDING", "PROPOSED"}
 
 
-def _pending_proposals(b: DraftBoard, me: int) -> list[dict]:
+def open_trade_proposals(transactions: list[dict], me: int, now_ms: int) -> list[dict]:
+    """Trade offers involving `me` that can still be answered.
+
+    ESPN never updates the original proposal: it stays PENDING for good, and
+    what became of it is a separate record pointing back through
+    relatedTransactionId (a decline, an accept, a cancellation). So a
+    proposal is open only if nothing refers to it and it has not run past
+    its expiration date.
+    """
+    answered = {t.get("relatedTransactionId") for t in transactions
+                if t.get("relatedTransactionId")}
     out = []
-    for t in b.client.transactions():
+    for t in transactions:
         if t.get("type") != "TRADE_PROPOSAL" or t.get("status") not in PENDING_TRADE_STATUSES:
+            continue
+        if t.get("relatedTransactionId") or t.get("id") in answered:
+            continue
+        if t.get("expirationDate") and int(t["expirationDate"]) <= now_ms:
             continue
         teams = {int(i.get("fromTeamId") or 0) for i in t.get("items") or []}
         teams |= {int(i.get("toTeamId") or 0) for i in t.get("items") or []}
         if me in teams:
             out.append(t)
     return out
+
+
+def _pending_proposals(b: DraftBoard, me: int) -> list[dict]:
+    import time
+    # Wall clock, not _now_ms: that one is the lineup-lock clock.
+    return open_trade_proposals(b.client.transactions(), me, int(time.time() * 1000))
 
 
 def _describe_proposal(b: DraftBoard, t: dict, me: int, week: int) -> dict:
@@ -1381,6 +1715,8 @@ def _describe_proposal(b: DraftBoard, t: dict, me: int, week: int) -> dict:
             "my_must_drop": ev["me"]["must_drop"],
             "my_violations": ev["me"]["violations"],
         }
+        if (view := trade_view(give, receive)):
+            out["evaluation"]["market"] = view
     else:
         out["note"] = "Some players in this offer are no longer on either roster."
     return out
@@ -1417,6 +1753,8 @@ def respond_to_trade(trade_id: str, action: str, apply: bool = False) -> dict:
         action: "accept", "decline" or "withdraw" (your own offer).
         apply: submit to ESPN. False previews the offer and the action.
     """
+    if (gate := _approval_gate(apply)):
+        return gate
     ctx = _my_context()
     if isinstance(ctx, dict):
         return ctx
@@ -1523,6 +1861,12 @@ def get_waiver_targets(position: str | None = None, limit: int = 12,
         "streamers_this_week": [e for e in by_week[:limit] if (e["lineup_gain_this_week"] or 0) > 0],
         "best_depth_by_ros_vorp": depth[:min(limit, 8)],
         "drop_candidates": [_slim_season(p) for p in drop_candidates(my, shape, 5, pos)],
+        "trending_pickups": sorted((e for e in scored if e.get("adds_24h")),
+                                   key=lambda e: -e["adds_24h"])[:min(limit, 8)],
+        "streaming": _streaming(my, avail, _now_ms()),
+        "workload_targets": sorted(
+            (e for e in scored if (e.get("usage") or {}).get("games", 0) >= 2),
+            key=lambda e: -e["usage"]["expected_ppg"])[:min(limit, 8)],
         "note": (
             "lineup_gain_* is the change in your optimal lineup total if the player "
             "is added (before any drop). 0 means he sits behind what you have. "
@@ -1533,6 +1877,31 @@ def get_waiver_targets(position: str | None = None, limit: int = 12,
     if shape.waivers.get("uses_faab"):
         spent = mine_t.get("faab_spent") or 0
         out["faab_remaining"] = (shape.waivers.get("faab_budget") or 0) - spent
+    if b.signals is None:
+        del out["trending_pickups"]
+        del out["workload_targets"]
+        del out["streaming"]
+    else:
+        out["outside_note"] = (
+            "streaming is defense and kicker by this week's matchup: my starter "
+            "against the best unrostered, by adj_week_proj. A defense is moved by "
+            "the points its opponent is expected to score (ESPN under-rates this: "
+            "against offenses expected to score under 17, defenses scored 10.1 where "
+            "ESPN said 7.2). A kicker is moved up indoors, where kickers scored a "
+            "point more than ESPN projected. upgrade is what swapping is worth this "
+            "week; it is one week's edge, so do not drop a useful player for it, and "
+            "note hold_count: more than one defense or kicker on the roster is a "
+            "bench spot a running back or receiver could have. "
+            "workload_targets are unrostered players ranked by what their carries "
+            "and targets say they should score (usage.expected_ppg), whatever they "
+            "have scored. On the waiver wire over two seasons, the top players by "
+            "workload went on to outscore the top players by points. A target with "
+            "expected_ppg well above ppg has the role and not yet the results. "
+            "trending_pickups are unrostered players being added across Sleeper "
+            "leagues right now, most added first: news is moving there before it "
+            "reaches this league's projections. Weigh them against lineup gain, "
+            "not instead of it. " + _OUTSIDE_NOTE)
+        out["data_sources"] = _sources(b)
     if (n := _week_note(shape)):
         out["season_note"] = n
     return out
@@ -1626,6 +1995,8 @@ def analyze_trade(give: list[str], receive: list[str],
             "ros_vorp_given": round(sum(p.get("vorp") or 0 for p in mine), 1),
             "ros_vorp_received": round(sum(p.get("vorp") or 0 for p in theirs_in), 1),
         },
+        "market": trade_view(mine, theirs_in),
+        "usage": _usage_view(mine, theirs_in),
         "note": (
             "starters_ros_per_game is each team's optimal lineup total in rest-of-"
             "season points per game -- the number that decides whether a trade "
@@ -1638,6 +2009,14 @@ def analyze_trade(give: list[str], receive: list[str],
         out["trade_deadline_passed"] = deadline["trade_deadline_passed"]
     if shape.trade_veto_votes:
         out["veto_votes_required"] = shape.trade_veto_votes
+    if out["usage"] is None:
+        del out["usage"]
+    if out["market"] is None:
+        del out["market"]
+    else:
+        out["likely_accepted"] = acceptable(
+            ev["them"]["delta"]["starters_ros_per_game"], out["market"])
+        out["market_note"] = _OUTSIDE_NOTE
     return out
 
 
@@ -1798,10 +2177,34 @@ def find_trade_partners(position: str | None = None, per_team: int = 3) -> dict:
                     best = {"give": mine_p["name"], "receive": theirs_p["name"],
                             "my_gain": mine_d, "their_gain": their_d,
                             "mutual_gain": round(score, 2)}
+        # The same search, judged the way the other manager will judge it:
+        # my lineup by projection, his side by what the market says he got.
+        # Anyone of mine can go back, not only players who would start for him.
+        sellable = None
+        for _, theirs_p in offers[:6]:
+            for mine_p in my_roster:
+                if not skill(mine_p) or mine_p.get("market_value") is None:
+                    continue
+                view = trade_view([mine_p], [theirs_p])
+                if view is None or view["their_market_gain_pct"] < 0:
+                    continue
+                ev = evaluate_trade(my_roster, roster, [mine_p], [theirs_p], shape)
+                if ev["me"]["violations"] or ev["them"]["violations"]:
+                    continue
+                mine_d = ev["me"]["delta"]["starters_ros_per_game"]
+                their_d = ev["them"]["delta"]["starters_ros_per_game"]
+                if mine_d <= 0 or not acceptable(their_d, view):
+                    continue
+                if sellable is None or mine_d > sellable["my_gain"]:
+                    sellable = {"give": mine_p["name"], "receive": theirs_p["name"],
+                                "my_gain": mine_d, "their_gain": their_d,
+                                "their_market_gain": view["their_market_gain"],
+                                "their_market_gain_pct": view["their_market_gain_pct"]}
         t = teams[tid]
         partners.append({
             **_team_brief(t),
             "best_1_for_1": best,
+            "best_by_market": sellable,
             "mutual": bool(best and best["my_gain"] > 0 and best["their_gain"] > 0),
             "their_needs": their_needs,
             "they_could_send": [{"my_lineup_gain": round(g, 2), **_slim_season(p)}
@@ -1810,7 +2213,7 @@ def find_trade_partners(position: str | None = None, per_team: int = 3) -> dict:
                              for g, p in asks[:per_team]],
             "trade_block": [p["name"] for p in roster if p.get("on_trade_block")],
         })
-    partners.sort(key=lambda t: (-t["mutual"],
+    partners.sort(key=lambda t: (-bool(t["best_by_market"]), -t["mutual"],
                                  -(t["best_1_for_1"] or {}).get("mutual_gain", -99),
                                  -t["they_could_send"][0]["my_lineup_gain"]))
 
@@ -1836,9 +2239,231 @@ def find_trade_partners(position: str | None = None, per_team: int = 3) -> dict:
             "2-for-1s and check roster limits with analyze_trade."
         ),
     }
+    if b.signals is not None:
+        hot = lambda p: (p.get("usage") or {}).get("view") == "running hot"  # noqa: E731
+        cold = lambda p: (p.get("usage") or {}).get("view") == "running cold"  # noqa: E731
+        out["sell_high"] = [_slim_season(p) for p in sorted(
+            (p for p in my_roster if hot(p)), key=lambda p: -p["usage"]["gap"])]
+        out["buy_low"] = [
+            {"owner": teams[tid]["name"], "team_id": tid,
+             "my_lineup_gain": round(waiver_gain(my_roster, p, shape)
+                                     ["lineup_gain_ros_per_game"], 2),
+             **_slim_season(p)}
+            for tid, p in sorted(((tid, p) for tid, roster in rosters.items() if tid != me
+                                  for p in roster if cold(p)),
+                                 key=lambda t: t[1]["usage"]["gap"])[:8]]
+        out["workload_note"] = (
+            "sell_high are my players scoring 3+ points a game above their workload; "
+            "buy_low are other teams' players scoring 3+ below theirs. Hot players "
+            "fell 2 to 4 points a game afterwards and cold ones rose about 2, in both "
+            "seasons tested. The other manager sees the points, not the workload: "
+            "offer a sell_high player for a buy_low one at similar points so far. "
+            "my_lineup_gain is by ESPN's projection, which may not see the rebound.")
+        out["sell_candidates"] = [
+            _slim_season(p) for p in sorted(
+                (p for p in my_roster if market_view(p) == "sell"),
+                key=lambda p: -p["market_gap"])]
+        out["market_note"] = (
+            "best_by_market is the 1-for-1 that raises my lineup the most among "
+            "those the other manager should accept: he comes out ahead on market "
+            "value and his lineup is not clearly worse. Offer these first. "
+            "sell_candidates are my players the market rates above their "
+            "projection. " + _OUTSIDE_NOTE)
+        out["data_sources"] = _sources(b)
     if (n := _week_note(shape)):
         out["season_note"] = n
     return out
+
+
+# --------------------------------------------------------------------------
+# Approval queue
+# --------------------------------------------------------------------------
+
+_store: ProposalStore | None = None
+
+
+def proposal_store() -> ProposalStore:
+    global _store
+    if _store is None:
+        cfg = board().cfg
+        _store = ProposalStore(
+            cfg.state_root / f"proposals-{cfg.league_id}-{cfg.season}.db")
+    return _store
+
+
+def _writers() -> dict:
+    return {"add_player": add_player, "drop_player": drop_player,
+            "propose_trade": propose_trade, "respond_to_trade": respond_to_trade,
+            "start_player": start_player}
+
+
+def _names(players: list[dict]) -> str:
+    return ", ".join(f"{p['name']} ({p['pos']})" for p in players) or "nobody"
+
+
+def _signed(value) -> str:
+    return f"{value:+.2f}" if isinstance(value, (int, float)) else "n/a"
+
+
+def _describe_move(action: str, params: dict, preview: dict) -> tuple[str, str]:
+    """Title and one-paragraph summary of a previewed move, from its numbers."""
+    if action == "add_player":
+        d = preview["delta"]
+        kind = "Waiver claim" if preview["transaction"] == "waiver claim" else "Add"
+        body = f"{kind}: {_names([preview['add']])}"
+        if preview["drop"]:
+            body += f", dropping {_names(preview['drop'])}"
+        body += (f". Starters {_signed(d['starters_ros_per_game'])} pts/game rest of "
+                 f"season, {_signed(d['starters_this_week'])} this week.")
+        if preview.get("waivers_clear"):
+            body += f" Waivers clear {preview['waivers_clear']}."
+        return f"Dodi: add {preview['add']['name']}?", body
+    if action == "drop_player":
+        d = preview["delta"]
+        return (f"Dodi: drop {preview['drop']['name']}?",
+                f"Drop {_names([preview['drop']])}. Starters "
+                f"{_signed(d['starters_ros_per_game'])} pts/game rest of season.")
+    if action == "propose_trade":
+        body = (f"Give {_names(preview['give'])} for {_names(preview['receive'])}. "
+                f"My starters {_signed(preview['me']['delta']['starters_ros_per_game'])} "
+                f"pts/game rest of season, theirs "
+                f"{_signed(preview['them']['delta']['starters_ros_per_game'])}.")
+        if (m := preview.get("market")):
+            body += (f" Market value: I give {m['value_given']}, get "
+                     f"{m['value_received']} ({m['verdict'].split(':')[0]}).")
+        return f"Dodi: offer trade to {preview['partner']['name']}?", body
+    if action == "start_player":
+        up, down = preview["start"], preview["sit"]
+        body = (f"Start {up['name']} at {preview['slot']} over {down['name']}. This "
+                f"week's projection: {up.get('week_proj')} vs {down.get('week_proj')} "
+                f"({_signed(preview['week_proj_change'])}). Rest of season per game: "
+                f"{up.get('ros_pg')} vs {down.get('ros_pg')}.")
+        mu, md = up.get("market"), down.get("market")
+        if mu or md:
+            body += (f" Trade value: {(mu or {}).get('value', 'unpriced')} vs "
+                     f"{(md or {}).get('value', 'unpriced')}.")
+        return f"Dodi: start {up['name']} over {down['name']}?", body
+    verb = preview["action"].capitalize()
+    body = (f"{verb} trade with {preview['partner'].get('name', 'team')}: give "
+            f"{_names(preview['give'])} for {_names(preview['receive'])}.")
+    ev = preview.get("evaluation")
+    if ev:
+        body += (f" My starters {_signed(ev['my_starters_ros_per_game_change'])} "
+                 "pts/game rest of season.")
+    return f"Dodi: {preview['action']} trade?", body
+
+
+def _expiry(action: str, preview: dict) -> float | None:
+    """When the move stops being possible, if sooner than the default."""
+    if action == "add_player" and preview.get("waivers_clear_ms"):
+        # A claim has to be in before the waiver run.
+        return preview["waivers_clear_ms"] / 1000 - 600
+    if action == "start_player" and preview.get("kickoff_ms"):
+        return preview["kickoff_ms"] / 1000 - 300
+    if action == "add_player" and preview.get("add_kickoff_ms"):
+        import time
+        by_kickoff = preview["add_kickoff_ms"] / 1000 - 300
+        # Only when his game is the nearer deadline; never shorten past "now".
+        if time.time() < by_kickoff < time.time() + 24 * 3600:
+            return by_kickoff
+    return None
+
+
+def queue_close_calls(limit: int = 2, calls: list[dict] | None = None) -> list[dict]:
+    """Put this week's close calls to the manager. Returns what was queued.
+
+    `calls` are the close_calls of a set_lineup result already in hand.
+    """
+    if calls is None:
+        calls = set_lineup(apply=False).get("close_calls") or []
+    queued = []
+    for c in calls[:limit]:
+        r = request_approval("start_player", {"player": c["start"], "over": c["over"]},
+                             "Too close for the projection to call, and he is the "
+                             "better player: " + "; ".join(c["reasons"]) + ". By "
+                             "history calls this close are a coin flip; it is your "
+                             "preference.")
+        if r.get("queued"):
+            queued.append(r["proposal"])
+    return queued
+
+
+@mcp.tool()
+@handle_errors
+def request_approval(action: str, params: dict, reasoning: str) -> dict:
+    """Queue a roster move or trade for the manager to approve.
+
+    The move is previewed first; if the preview fails, nothing is queued and
+    the reason comes back. Otherwise it is stored and pushed to the manager's
+    phone with approve and reject buttons, and sent to ESPN only on approve.
+    The same move is not queued twice, and one the manager rejected is not
+    offered again for three days.
+
+    Args:
+        action: add_player, drop_player, propose_trade, respond_to_trade, or
+            start_player (a close start/sit call from set_lineup).
+        params: that tool's arguments, without `apply`. E.g.
+            {"add": "Player A", "drop": "Player B"},
+            {"player": "Benched Star", "over": "Current Starter"},
+            {"give": ["A"], "receive": ["B"], "partner_team_id": 6},
+            {"trade_id": "...", "action": "accept"}.
+        reasoning: why this move, in two or three sentences. The manager
+            reads this on his phone when deciding.
+    """
+    try:
+        params = clean_params(action, params or {})
+    except ProposalError as exc:
+        return {"queued": False, "error": str(exc)}
+    store = proposal_store()
+    blocking = store.find_blocking(action, params)
+    if blocking:
+        return {"queued": False, "already": blocking["status"],
+                "proposal": public(blocking),
+                "note": ("Rejected recently; do not ask again." if blocking["status"] == "rejected"
+                         else "Already waiting on the manager.")}
+    preview = _writers()[action](**params, apply=False)
+    if "error" in preview:
+        return {"queued": False, "error": preview["error"], "preview": preview}
+    title, summary = _describe_move(action, params, preview)
+    try:
+        proposal = store.create(action, params, title=title, summary=summary,
+                                reasoning=(reasoning or "").strip(),
+                                expires_at=_expiry(action, preview))
+    except ProposalError as exc:
+        return {"queued": False, "error": str(exc)}
+    sent = push_proposal(board().cfg, proposal)
+    by = deadline(board().cfg, proposal)
+    out = {"queued": True, "proposal": public(proposal), "notified": sent["sent"],
+           "decide_by": by["text"]}
+    if by["short_notice"]:
+        out["short_notice"] = (
+            f"Only {by['minutes']} minutes to decide; the manager asked for "
+            f"{board().cfg.approval_lead_minutes}. Sent as urgent. Queue earlier next time.")
+    if not sent["sent"]:
+        out["note"] = f"Queued, but the notification failed: {sent['reason']}"
+    return out
+
+
+@mcp.tool()
+@handle_errors
+def get_proposals(status: str | None = None, limit: int = 10) -> dict:
+    """Moves queued for approval, newest first, and what became of them.
+
+    Args:
+        status: pending, approved, applied, failed, rejected or expired.
+        limit: how many to return.
+    """
+    rows = proposal_store().list(status, limit)
+    return {"count": len(rows), "proposals": [public(p) for p in rows]}
+
+
+def execute_proposal(proposal: dict) -> dict:
+    """Replay an approved proposal against ESPN. Used by the approval service."""
+    token = _approved_call.set(True)
+    try:
+        return _writers()[proposal["action"]](**proposal["params"], apply=True)
+    finally:
+        _approved_call.reset(token)
 
 
 def main() -> None:

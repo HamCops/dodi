@@ -25,6 +25,20 @@ from .constants import (
 )
 from .scoring import LeagueShape
 
+# What the lineup is set by: ESPN's projection for the week, nudged by the
+# betting line when outside data is on, and ESPN's own number otherwise.
+START_KEY = "start_proj"
+
+
+def with_start_proj(players: list[dict]) -> list[dict]:
+    """Copies of `players`, each with the number the lineup is set by."""
+    out = []
+    for p in players:
+        adj = p.get("adj_week_proj")
+        out.append({**p, START_KEY: adj if adj is not None else p.get(WEEK_KEY)})
+    return out
+
+
 ROS_KEY = "ros_per_game"
 WEEK_KEY = "week_proj"
 
@@ -229,6 +243,82 @@ def plan_lineup(players: list[dict], shape: LeagueShape, key: str,
         "locked": locked,
         "unfilled": unfilled,
     }
+
+
+# A weekly projection is a guess with several points of error either way. A
+# starter ahead of a benched player by less than this is not ahead in any way
+# that should decide the matter on its own.
+#
+# What two seasons say about these calls: between players projected within
+# half a point, starting the one ranked far higher before the season came out
+# even (50.6% right, +0.03 points). Wider than half a point, the projection
+# is right more often than the reputation. So this is a preference put to the
+# manager, not an edge, and it is kept narrow.
+CLOSE_CALL_MARGIN = 0.5
+# What makes the benched player "clearly the better player": this much more
+# per game over the rest of the season, or this many times the trade value.
+CLOSE_CALL_ROS_EDGE = 1.0
+CLOSE_CALL_MARKET_RATIO = 1.5
+
+NOT_PLAYING = ("OUT", "INJURY_RESERVE", "SUSPENSION", "DOUBTFUL")
+
+
+def close_calls(players: list[dict], shape: LeagueShape, key: str,
+                now_ms: int | None = None) -> list[dict]:
+    """Benched players who are nearly level with a starter this week and are
+    clearly the better player by every longer view.
+
+    The optimizer starts whoever projects higher this week, by any margin.
+    That is right when the gap is real and wrong when it is a rounding
+    error: a star back from injury, projected a fraction under his
+    replacement, sits. These are the decisions to put to a person.
+
+    One call per benched player, against the starter he most clearly
+    outclasses. Returns [{start, sit, slot, week_gap, reasons}].
+    """
+    starters = [p for p in current_starters(players) if not is_locked(p, now_ms)]
+    out = []
+    for b in players:
+        if b.get("slot_id") != BENCH_SLOT_ID or is_locked(b, now_ms):
+            continue
+        if b.get("position") in ("K", "D/ST") or b.get("on_bye"):
+            continue
+        if (b.get("injury_status") or "").upper() in NOT_PLAYING or _val(b, key) <= 0:
+            continue
+        found = []
+        for s in starters:
+            slot = SLOT_BY_ID.get(s["slot_id"], str(s["slot_id"]))
+            if slot not in (b.get("eligible_slots") or []):
+                continue
+            gap = round(_val(s, key) - _val(b, key), 2)
+            if gap < 0 or gap > CLOSE_CALL_MARGIN:
+                continue
+            reasons = []
+            ros_edge = round(_val(b, ROS_KEY) - _val(s, ROS_KEY), 2)
+            if b.get(ROS_KEY) is not None and s.get(ROS_KEY) is not None \
+                    and ros_edge >= CLOSE_CALL_ROS_EDGE:
+                reasons.append(f"{ros_edge:+.1f} pts/game rest of season")
+            mb, ms = b.get("market_value"), s.get("market_value")
+            if mb and mb >= CLOSE_CALL_MARKET_RATIO * (ms or 0):
+                reasons.append(f"trade value {mb} vs {ms or 'unpriced'}")
+            if not reasons:
+                continue
+            strength = ros_edge + (mb or 0) / max(ms or 1, 1)
+            found.append((strength, {"start": b, "sit": s, "slot": slot,
+                                     "week_gap": gap, "reasons": reasons}))
+        out.extend(found)
+    # Strongest case first. A starter can only be replaced once and a benched
+    # player can only start once; whoever loses his first choice of starter
+    # falls to his next.
+    out.sort(key=lambda t: -t[0])
+    calls, sat, started = [], set(), set()
+    for _, c in out:
+        if c["sit"]["player_id"] in sat or c["start"]["player_id"] in started:
+            continue
+        sat.add(c["sit"]["player_id"])
+        started.add(c["start"]["player_id"])
+        calls.append(c)
+    return calls
 
 
 def plan_move(players: list[dict], shape: LeagueShape, mover: dict, to_slot_id: int,

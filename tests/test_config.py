@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import espn_mcp.config as config  # noqa: E402
 
 VARS = ("ESPN_LEAGUE_ID", "ESPN_SEASON", "ESPN_TEAM_ID", "ESPN_S2", "SWID",
-        "ESPN_POOL_TTL", "ESPN_STATE_DIR")
+        "ESPN_POOL_TTL", "ESPN_STATE_DIR", "ESPN_REQUIRE_APPROVAL", "NTFY_URL",
+        "NTFY_TOPIC", "NTFY_TOKEN", "APPROVE_BASE_URL", "APPROVE_PORT", "ESPN_EXTERNAL_SOURCES",
+        "APPROVAL_LEAD_MINUTES", "ESPN_TIMEZONE", "GAMETIME_HOOK")
 
 
 @pytest.fixture

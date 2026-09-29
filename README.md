@@ -130,6 +130,74 @@ sent elsewhere. They expire mid-season; an auth error means re-copy them.
 | `get_league_settings` | Scoring, roster slots, team count, draft type. Call once per session. |
 | `get_transactions` | Full transaction log — lineup moves, adds, drops, claims, trades — by team and week. |
 
+### Approvals
+
+| Tool | What it does |
+|---|---|
+| `request_approval` | Queue an add, drop, trade offer, trade answer or start/sit call for the manager. Previewed first; sent to ESPN only when approved. |
+| `get_proposals` | What is waiting, and what was approved, rejected or expired. |
+
+## Running it hands-off
+
+Everything in this section is optional and off by default. Each part is
+switched on in `.env`; `.env.example` documents the settings.
+
+### Approve from your phone
+
+With `ESPN_REQUIRE_APPROVAL=1`, roster moves and trades can no longer be
+sent directly: `add_player`, `drop_player`, `propose_trade` and
+`respond_to_trade` refuse `apply=true`, in the server, whatever the prompt
+says. The agent queues them with `request_approval`, and you get an
+[ntfy](https://ntfy.sh) notification with Approve, Reject and Details
+buttons. Lineup changes stay direct.
+
+`espn-mcp-approve` is the service behind the buttons. It listens on
+loopback only. Put it behind something private (a tailnet, a VPN), never
+the open internet: approving a proposal makes a real roster move. Each
+proposal has its own token, a decision can be made once, and a proposal
+interrupted mid-send is closed, never retried.
+
+### Decisions by the kickoff clock
+
+Run `espn-mcp-tick` every five minutes. For each group of games on your
+roster it counts back from the real kickoff:
+
+| When | What |
+|---|---|
+| Kickoff − 65 min | Calls `GAMETIME_HOOK`, to start your agent |
+| Kickoff − 45 min | Sets the lineup (`espn-mcp-lineup`, no model) and sends close calls |
+| Kickoff − 5 min | Approval requests for that game expire |
+
+Both runs come after inactives are announced, and leave
+`APPROVAL_LEAD_MINUTES` (default 30) to answer. `espn-mcp-tick status`
+prints the week's plan.
+
+### Outside data
+
+With `ESPN_EXTERNAL_SOURCES=1`, player records also carry:
+
+| Field | Source | What it is |
+|---|---|---|
+| `market` | FantasyCalc | Trade value from completed trades |
+| `usage` | nflverse | Points scored against what carries and targets say he should score |
+| `game` | ESPN scoreboard, Open-Meteo | Betting line, roof, forecast at kickoff |
+| `adj_week_proj` | derived | ESPN's projection moved by the betting line; the lineup is set by it |
+| `adds_24h`, `alt_week_proj`, `injury_alt` | Sleeper | Pickup trend, a second projection, a second injury report |
+
+All public, no keys. Every source is cached and fails soft: one that is
+down leaves its fields off and the tools carry on with ESPN alone.
+
+What is used and how much it counts was decided by testing each signal on
+two past seasons, fit on one and scored on the other. Most did not survive.
+[`research/README.md`](research/README.md) has the method, the results,
+what was thrown out, and the scripts to rerun it.
+
+### Weekly review
+
+`espn-mcp-report` prints last week's result, the points left on the bench,
+how each projection did against what was recorded before kickoff, and how
+the approved and rejected moves turned out.
+
 ## Building an agent on top (the Dodi pattern)
 
 The MCP server is the tool layer. Your agent is the brain. Here's how Dodi
@@ -259,6 +327,17 @@ src/espn_mcp/
                  trade / waiver deltas, transaction log     (pure, tested)
   board.py       caching layer, draft state, in-season rosters and matchups
   server.py      the MCP tools
+  proposals.py   the approval queue                         (pure, tested)
+  notify.py      ntfy pushes and the approval buttons
+  approve.py     the service behind the buttons
+  gametime.py    scheduling counted back from kickoff
+  autolineup.py  set the lineup without a model
+  usage.py       expected points from workload              (pure, tested)
+  market.py      trade arithmetic on market values          (pure, tested)
+  tracking.py    what was known before kickoff, for scoring later
+  report.py      the weekly review
+  sources/       Sleeper, FantasyCalc, nflverse, betting lines, weather
+research/        the backtests behind every outside signal
 scripts/
   doctor.py              credential + access check
   snapshot.py            offline fallback board
