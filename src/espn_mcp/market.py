@@ -66,3 +66,40 @@ def acceptable(their_lineup_change: float, view: dict | None,
     if share > -EVEN_WITHIN:
         return their_lineup_change >= 0
     return False
+
+
+# --- Is a trade worth offering at all? ---------------------------------------
+#
+# "Raises my lineup and he would say yes" is not enough: a trade he says yes
+# to because it is a steal for him is a bad trade for me. On 2026-09-29 the
+# old test passed Christian Watson (market 3653) for Michael Wilson (1362):
+# +0.25 a game for me, -0.82 this week, 63% of the value handed over.
+
+MIN_TRADE_GAIN = 0.5    # my starters, rest-of-season points per game
+MAX_OVERPAY = 0.25      # share of the larger side's market value I may give away
+MAX_WEEK_COST = 0.25    # points this week; less than this is projection noise
+MAX_OUTLOOK_LOSS = 1.0  # points a game by workload (usage outlook), net
+
+
+def worth_offering(my_gain: float, my_week_change: float, view: dict | None,
+                   usage: dict | None = None) -> dict:
+    """Would I make this trade, whatever the other side thinks?
+
+    Returns {"ok": bool, "reasons": [...]}: every rule it breaks, so a
+    report can say exactly why it was passed over.
+    """
+    reasons = []
+    if my_gain < MIN_TRADE_GAIN:
+        reasons.append(f"my starters gain {my_gain:+.2f} a game; the bar is "
+                       f"+{MIN_TRADE_GAIN}")
+    if my_week_change < -MAX_WEEK_COST:
+        reasons.append(f"costs {my_week_change:+.2f} this week")
+    if view is not None and view["their_market_gain_pct"] / 100 > MAX_OVERPAY:
+        reasons.append(f"gives away {view['their_market_gain_pct']}% of the market value "
+                       f"({view['value_given']} for {view['value_received']}); the cap "
+                       f"is {round(MAX_OVERPAY * 100)}%")
+    if usage and usage.get("outlook_change") is not None \
+            and usage["outlook_change"] < -MAX_OUTLOOK_LOSS:
+        reasons.append(f"workload outlook {usage['outlook_change']:+.2f} a game: "
+                       "the player going out is the better bet")
+    return {"ok": not reasons, "reasons": reasons}

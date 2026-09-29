@@ -21,7 +21,7 @@ from .constants import SLOT_BY_ID
 from .config import Config, load_config
 from .espn import ESPNError
 from .factcheck import known_numbers, unsupported_numbers
-from .market import acceptable, trade_view
+from .market import acceptable, trade_view, worth_offering
 from .notify import deadline, push_proposal
 from .proposals import ProposalError, ProposalStore, clean_params, public
 from .scoring import LeagueShape
@@ -2065,6 +2065,12 @@ def analyze_trade(give: list[str], receive: list[str],
         out["likely_accepted"] = acceptable(
             ev["them"]["delta"]["starters_ros_per_game"], out["market"])
         out["market_note"] = _OUTSIDE_NOTE
+    worth = worth_offering(ev["me"]["delta"]["starters_ros_per_game"],
+                           ev["me"]["delta"]["starters_this_week"],
+                           out.get("market"), out.get("usage"))
+    out["worth_offering"] = worth["ok"]
+    if worth["reasons"]:
+        out["not_worth_because"] = worth["reasons"]
     return out
 
 
@@ -2242,6 +2248,10 @@ def find_trade_partners(position: str | None = None, per_team: int = 3) -> dict:
                 mine_d = ev["me"]["delta"]["starters_ros_per_game"]
                 their_d = ev["them"]["delta"]["starters_ros_per_game"]
                 if mine_d <= 0 or not acceptable(their_d, view):
+                    continue
+                # Accepted is not enough: it has to be a trade I would make.
+                if not worth_offering(mine_d, ev["me"]["delta"]["starters_this_week"],
+                                      view, _usage_view([mine_p], [theirs_p]))["ok"]:
                     continue
                 if sellable is None or mine_d > sellable["my_gain"]:
                     sellable = {"give": mine_p["name"], "receive": theirs_p["name"],

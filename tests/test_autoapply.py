@@ -46,12 +46,42 @@ def test_defense_and_kicker_stream_like_for_like_on_this_week_alone():
 
 
 def test_trades_offered_only_when_they_help_me_and_should_be_accepted():
-    good = {"me": {"delta": {"starters_ros_per_game": 0.8}}, "likely_accepted": True}
+    good = {"me": {"delta": {"starters_ros_per_game": 0.8}}, "likely_accepted": True,
+            "worth_offering": True}
     assert auto_ok("propose_trade", {}, good)[0]
     assert not auto_ok("propose_trade", {}, {**good, "likely_accepted": False})[0]
     assert not auto_ok("propose_trade", {}, {**good, "me": {"delta": {
         "starters_ros_per_game": -0.1}}})[0]
     assert not auto_ok("propose_trade", {}, {**good, "usage": {"warning": "Buying high"}})[0]
+    # An old preview without the check is never sent on its own.
+    assert not auto_ok("propose_trade", {}, {k: v for k, v in good.items()
+                                             if k != "worth_offering"})[0]
+
+
+def test_a_steal_for_them_is_not_a_trade_worth_making():
+    """A trade the manager rejected as lopsided, with its real numbers."""
+    from espn_mcp.market import trade_view, worth_offering
+
+    watson = {"name": "Christian Watson", "market_value": 3653}
+    wilson = {"name": "Michael Wilson", "market_value": 1362}
+    view = trade_view([watson], [wilson])
+    verdict = worth_offering(0.25, -0.82, view, {"outlook_change": -5.5})
+    assert not verdict["ok"]
+    text = " ".join(verdict["reasons"])
+    assert "+0.25" in text and "this week" in text and "63%" in text and "workload" in text
+    preview = {"me": {"delta": {"starters_ros_per_game": 0.25}}, "likely_accepted": True,
+               "worth_offering": False, "not_worth_because": verdict["reasons"]}
+    ok, why = auto_ok("propose_trade", {}, preview)
+    assert not ok and "63%" in why
+
+    # Maye for Pickens: I gain value and a lot of lineup. Worth offering.
+    maye, pickens = {"market_value": 1049}, {"market_value": 3951}
+    assert worth_offering(1.92, 0.39, trade_view([maye], [pickens]))["ok"]
+    # A fair swap inside the overpay cap is fine; one just past it is not.
+    assert worth_offering(0.6, 0.0, trade_view([{"market_value": 1200}],
+                                               [{"market_value": 1000}]))["ok"]
+    assert not worth_offering(0.6, 0.0, trade_view([{"market_value": 1400}],
+                                                   [{"market_value": 1000}]))["ok"]
 
 
 def test_accepting_a_trade_and_bare_drops_always_wait():

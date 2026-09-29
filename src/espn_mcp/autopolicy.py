@@ -49,11 +49,14 @@ def _trade(params: dict, preview: dict) -> tuple[bool, str]:
     mine = ((preview.get("me") or {}).get("delta") or {}).get("starters_ros_per_game") or 0
     if mine <= 0:
         return False, "Does not raise my starters."
+    if preview.get("worth_offering") is not True:
+        why = "; ".join(preview.get("not_worth_because") or []) or "not checked"
+        return False, f"Not a trade I would make on my own: {why}."
     if preview.get("likely_accepted") is not True:
         return False, "Not likely to be accepted."
     if (preview.get("usage") or {}).get("warning"):
         return False, "Usage warning: buys a player running hot or sells one running cold."
-    return True, "Raises my starters and should be accepted."
+    return True, "Clearly raises my starters, fair on value, and should be accepted."
 
 
 def _respond(params: dict, preview: dict) -> tuple[bool, str]:
