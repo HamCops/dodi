@@ -171,6 +171,14 @@ def tick(now: float | None = None, *, board_fn: Callable | None = None,
                                       "roster"):
             sched.data["roster_run_week"] = week
             did.append(f"roster run for week {week}: started (players unlocked)")
+            # Set the week's lineup now too, so it is never left as last
+            # week's until the first kickoff window. The per-kickoff runs
+            # still reset it after inactives.
+            if (run_lineup or _run_lineup)() == 0:
+                did.append(f"lineup set for week {week} (players unlocked)")
+            else:
+                failed.append(f"lineup for week {week} on unlock failed; the kickoff "
+                              "runs will set it")
         else:
             failed.append(f"roster run for week {week}: hook failed, will retry")
         sched.save()
@@ -251,6 +259,11 @@ def main() -> None:
         print(time.strftime("%Y-%m-%d %H:%M:%S"), f"tick failed: {type(exc).__name__}: {exc}")
         _alert(f"{type(exc).__name__}: {exc}")
         sys.exit(1)
+    # Auto-apply what the policy allows, and chase what still waits on him.
+    # After the tick, and never able to fail it.
+    from .nudge import run as nudge
+    for line in nudge():
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), line)
 
 
 def _alert(error: str) -> None:

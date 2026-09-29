@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS proposals_status ON proposals (status);
 """
 
+# Added after the first release; applied to an existing database on open.
+MIGRATIONS = (
+    "ALTER TABLE proposals ADD COLUMN reminded_at REAL",
+    "ALTER TABLE proposals ADD COLUMN last_call_at REAL",
+)
+
 
 class ProposalError(ValueError):
     """The request cannot be queued or decided; the message says why."""
@@ -107,6 +113,10 @@ class ProposalStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.executescript(SCHEMA)
+            cols = {r[1] for r in db.execute("PRAGMA table_info(proposals)")}
+            for stmt in MIGRATIONS:
+                if stmt.split()[5] not in cols:
+                    db.execute(stmt)
         self.path.chmod(0o600)  # holds the approval tokens
 
     def _db(self) -> sqlite3.Connection:
@@ -214,3 +224,21 @@ class ProposalStore:
                 "UPDATE proposals SET status=?, result=? WHERE id=? AND status='approved'",
                 ("applied" if ok else "failed", json.dumps(result, default=str), pid))
         return self.get(pid)  # type: ignore[return-value]
+
+    def mark_reminded(self, pid: str, kind: str, now: float | None = None) -> None:
+        """Record a reminder push: `kind` is 'reminded' or 'last_call'."""
+        if kind not in ("reminded", "last_call"):
+            raise ProposalError("kind must be reminded or last_call.")
+        column = "reminded_at" if kind == "reminded" else "last_call_at"
+        with self._db() as db:
+            db.execute(f"UPDATE proposals SET {column}=? WHERE id=?",
+                       (time.time() if now is None else now, pid))
+
+    def reminders_since(self, since: float) -> int:
+        """How many reminder pushes went out after `since`, across proposals."""
+        with self._db() as db:
+            row = db.execute(
+                "SELECT (SELECT COUNT(*) FROM proposals WHERE reminded_at>?) + "
+                "(SELECT COUNT(*) FROM proposals WHERE last_call_at>?)",
+                (since, since)).fetchone()
+        return int(row[0])

@@ -15,6 +15,7 @@ from typing import Any
 from mcp.server import MCPServer
 
 from . import __version__
+from .autopolicy import auto_ok
 from .board import DraftBoard
 from .constants import SLOT_BY_ID
 from .config import Config, load_config
@@ -2459,6 +2460,24 @@ def queue_close_calls(limit: int = 2, calls: list[dict] | None = None) -> list[d
     return queued
 
 
+def _auto_apply(proposal: dict, why: str) -> dict:
+    """Make a move the policy allows without asking, and tell the manager.
+
+    Goes through the same record as an approved proposal (approved, then
+    applied or failed), so get_proposals and the weekly review see it. The
+    push after it says what was done and why; a failure says so loudly.
+    """
+    from .approve import apply_proposal
+    store = proposal_store()
+    store.decide(proposal["id"], "approved")
+    done = apply_proposal(store.get(proposal["id"]) or proposal, auto=True, why=why)
+    out = {"queued": False, "auto_applied": done["status"] == "applied",
+           "status": done["status"], "proposal": public(done), "policy": why}
+    if done["status"] != "applied":
+        out["error"] = (done.get("result") or {}).get("error") or "ESPN did not apply it."
+    return out
+
+
 @mcp.tool()
 @handle_errors
 def request_approval(action: str, params: dict, reasoning: str) -> dict:
@@ -2512,12 +2531,19 @@ def request_approval(action: str, params: dict, reasoning: str) -> dict:
                 "note": ("Rejected recently; do not ask again." if blocking["status"] == "rejected"
                          else "Already waiting on the manager.")}
     title, summary = _describe_move(action, params, preview)
+    auto, why = (auto_ok(action, params, preview) if board().cfg.auto_apply
+                 else (False, ""))
+    if board().cfg.auto_apply and not auto:
+        # He is being asked; tell him why this one was not made for him.
+        summary = f"{summary} Asked because: {why}"
     try:
         proposal = store.create(action, params, title=title, summary=summary,
                                 reasoning=(reasoning or "").strip(),
                                 expires_at=_expiry(action, preview))
     except ProposalError as exc:
         return {"queued": False, "error": str(exc)}
+    if auto:
+        return _auto_apply(proposal, why)
     sent = push_proposal(board().cfg, proposal)
     by = deadline(board().cfg, proposal)
     out = {"queued": True, "proposal": public(proposal), "notified": sent["sent"],

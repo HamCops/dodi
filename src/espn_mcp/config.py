@@ -48,6 +48,13 @@ class Config:
     # Approval queue. With require_approval, roster moves and trades are only
     # sent to ESPN through an approved proposal; lineup changes stay direct.
     require_approval: bool = False
+    # With auto_apply, a requested move that passes autopolicy.auto_ok is
+    # applied at once and the manager is told afterwards; the rest still
+    # wait on his approval.
+    auto_apply: bool = False
+    # Minutes after which an undecided proposal is pushed again (once), and
+    # at most how many reminders go out in one hour across all proposals.
+    remind_after_minutes: int = 60
     ntfy_url: str | None = None
     ntfy_topic: str | None = None
     ntfy_token: str | None = None
@@ -110,6 +117,8 @@ def load_config() -> Config:
         pool_ttl=int(os.environ.get("ESPN_POOL_TTL", "900")),
         state_dir=os.environ.get("ESPN_STATE_DIR") or None,
         require_approval=_flag(os.environ.get("ESPN_REQUIRE_APPROVAL")),
+        auto_apply=_flag(os.environ.get("ESPN_AUTO_APPLY")),
+        remind_after_minutes=int(os.environ.get("REMIND_AFTER_MINUTES", "60")),
         ntfy_url=os.environ.get("NTFY_URL", "").strip() or None,
         ntfy_topic=os.environ.get("NTFY_TOPIC", "").strip() or None,
         ntfy_token=os.environ.get("NTFY_TOKEN", "").strip() or None,

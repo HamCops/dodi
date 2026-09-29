@@ -747,7 +747,7 @@ def test_add_player_files_a_waiver_claim_for_a_player_on_waivers(monkeypatch):
         assert pre["transaction"] == "waiver claim" and pre["waivers_clear"]
         done = _tool("add_player", add=target["name"], apply=True)
         body = b.client.posts[0]
-        assert body["type"] == "WAIVER" and body["executionType"] == "PROCESS"
+        assert body["type"] == "WAIVER" and body["executionType"] == "EXECUTE"
         assert done["espn_status"] == "PENDING" and "waiver run" in done["note"]
     finally:
         srv._board = None

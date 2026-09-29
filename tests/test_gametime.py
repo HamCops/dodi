@@ -88,9 +88,12 @@ def test_each_run_happens_once_and_idle_ticks_do_not_call_espn(tmp_path):
     log: list[str] = []
     kw = dict(board_fn=lambda: b, run_lineup=lambda: log.append("lineup") or 0,
               run_agent=lambda slot, hook, event="agent": log.append(event) or True)
-    # The first look at a new week asks about roster moves, once.
+    # The first look at a new week asks about roster moves, once, and sets
+    # the week's lineup straight away rather than leaving last week's.
     assert tick(at(1, 12) / 1000, **kw) == [
-        "roster run for week 4: started (players unlocked)"] and b.reads == 1
+        "roster run for week 4: started (players unlocked)",
+        "lineup set for week 4 (players unlocked)"] and b.reads == 1
+    assert log == ["roster", "lineup"]
     assert tick(at(1, 12, 5) / 1000, **kw) == [] and b.reads == 1     # idle: from disk
     log.clear()
 
@@ -211,7 +214,8 @@ def test_the_agent_is_asked_about_roster_moves_when_the_week_unlocks(tmp_path, m
     assert tick(sep(29, 4, 0), **kw) == [] and log == []
     assert "Roster moves: unlocked" in _status(b, sep(29, 4, 1), monkeypatch)
     assert tick(sep(29, 8, 55), **kw) == []
-    assert tick(sep(29, 9, 0), **kw) == ["roster run for week 4: started (players unlocked)"]
+    assert tick(sep(29, 9, 0), **kw) == ["roster run for week 4: started (players unlocked)",
+                                         "lineup set for week 4 (players unlocked)"]
     assert log == ["roster"]
     # Once a week, however many ticks follow and however often it re-reads.
     for hour in (9, 12, 15, 20):

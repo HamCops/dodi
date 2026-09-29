@@ -224,7 +224,8 @@ def test_add_drop_transaction_shapes():
         assert fa["items"] == [{"playerId": 111, "type": "ADD", "toTeamId": 12},
                                {"playerId": 222, "type": "DROP", "fromTeamId": 12}]
         w = c.add_drop_transaction(12, 3, [111], [], waiver=True, bid=5)
-        assert w["type"] == "WAIVER" and w["executionType"] == "PROCESS" and w["bidAmount"] == 5
+        # EXECUTE, not PROCESS: ESPN answers a client PROCESS with HTTP 409.
+        assert w["type"] == "WAIVER" and w["executionType"] == "EXECUTE" and w["bidAmount"] == 5
         assert w["items"] == [{"playerId": 111, "type": "ADD", "toTeamId": 12}]
     finally:
         c.close()

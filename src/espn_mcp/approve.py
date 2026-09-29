@@ -122,8 +122,13 @@ def _denied() -> Response:
     return JSONResponse({"error": "Not found."}, status_code=404)
 
 
-def apply_proposal(proposal: dict) -> dict:
-    """Send an approved proposal to ESPN, record the outcome, and report it."""
+def apply_proposal(proposal: dict, *, auto: bool = False, why: str = "") -> dict:
+    """Send an approved proposal to ESPN, record the outcome, and report it.
+
+    `auto` marks a move Dodi made on his own under the auto-apply policy:
+    the push then says so, with the rule that allowed it and his reasoning,
+    since the manager never saw it beforehand.
+    """
     from .server import board, execute_proposal
     try:
         result = execute_proposal(proposal)
@@ -131,11 +136,19 @@ def apply_proposal(proposal: dict) -> dict:
         result = {"error": f"{type(exc).__name__}: {exc}"}
     ok = bool(result.get("applied")) and "error" not in result
     done = _store().finish(proposal["id"], ok, _brief(result))
-    log.info("proposal %s %s", proposal["id"], done["status"])
+    log.info("proposal %s %s%s", proposal["id"], done["status"], " (auto)" if auto else "")
     if ok:
         note = result.get("note") or "Sent to ESPN."
-        push(board().cfg, "Dodi: done", f"{proposal['summary']}\n\n{note}",
-             tags=["white_check_mark"])
+        if auto:
+            body = f"THE MOVE\n{proposal['summary']}\n\n{note}\nRule: {why}"
+            if proposal.get("reasoning"):
+                body += f"\n\nDODI'S VIEW\n{proposal['reasoning']}"
+            push(board().cfg, "Dodi did it: "
+                 + proposal['title'].removeprefix('Dodi: ').rstrip('?'),
+                 body, tags=["robot"])
+        else:
+            push(board().cfg, "Dodi: done", f"{proposal['summary']}\n\n{note}",
+                 tags=["white_check_mark"])
     else:
         push(board().cfg, "Dodi: move failed",
              f"{proposal['summary']}\n\n{_plain_error(result)}",

@@ -183,7 +183,11 @@ class ESPNClient:
         items += [{"playerId": int(pid), "type": "DROP", "fromTeamId": int(team_id)}
                   for pid in drop_ids]
         if waiver:
-            return self._transaction("WAIVER", team_id, week, items, execution="PROCESS",
+            # A manager's claim is submitted as EXECUTE and sits PENDING until
+            # the waiver run. PROCESS is what ESPN's nightly processor stamps
+            # on the claims it resolves; a client sending it gets HTTP 409
+            # "Transaction ExecutionType PROCESS is not supported".
+            return self._transaction("WAIVER", team_id, week, items,
                                      bidAmount=int(bid or 0))
         return self._transaction("FREEAGENT", team_id, week, items)
 
