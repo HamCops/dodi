@@ -407,7 +407,12 @@ def roster_violations(players: list[dict], shape: LeagueShape,
     if over > 0:
         out.append(f"{over} over the roster limit of {active_limit(shape)} "
                    f"(not counting IR) -- must drop {over}")
-    for pos, n in position_counts(players).items():
+    arriving = {p["player_id"] for p in incoming}
+    # Position limits skip IR too: ESPN lets a team hold a ninth RB when one
+    # of the nine sits in an IR slot (seen in this league, week 4).
+    active = [p for p in players
+              if p["player_id"] in arriving or p.get("slot_id") != IR_SLOT_ID]
+    for pos, n in position_counts(active).items():
         cap = shape.position_limits.get(pos)
         if cap is not None and n > cap:
             out.append(f"{n} {pos} exceeds the league limit of {cap}")

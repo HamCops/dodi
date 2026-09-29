@@ -264,6 +264,12 @@ def test_position_limits_are_enforced():
     object.__setattr__(shape, "position_limits", {"RB": 3})
     four_rbs = [player(f"RB {i}", "RB", 10) for i in range(4)]
     assert roster_violations(four_rbs, shape) == ["4 RB exceeds the league limit of 3"]
+    # One of the four on IR: ESPN does not count him against the limit, but
+    # a player arriving counts whatever slot he held on his old team.
+    on_ir = four_rbs[:3] + [{**four_rbs[3], "slot_id": 21}]
+    assert roster_violations(on_ir, shape) == []
+    assert roster_violations(on_ir, shape, incoming=[on_ir[3]]) == [
+        "4 RB exceeds the league limit of 3"]
 
 
 def test_roster_profile_starter_strength_counts_flex_toward_its_position():
