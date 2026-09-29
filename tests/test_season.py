@@ -717,19 +717,18 @@ def test_add_player_previews_then_adds_a_free_agent_and_needs_a_drop_when_full(m
         mine = b.team_players(CFG.team_id)
         assert len(mine) == 16 and free["player_id"] in {p["player_id"] for p in mine}
 
-        # Fill the last spot (limit is 17): the add after that needs a drop.
-        _tool("add_player", add=b.season_available()[0]["name"], apply=True)
-        assert len(b.team_players(CFG.team_id)) == 17
+        # That was the last spot. The league has 17 slots, but one is IR, and
+        # an empty IR slot holds nobody: 16 is full, and the next add needs a drop.
         nxt = b.season_available()[0]
         full = _tool("add_player", add=nxt["name"])
         assert "name a player to drop" in full["error"]
         assert full["suggested_drops"]
-        cut = full["suggested_drops"][0]["name"]
+        cut = next(p["name"] for p in full["suggested_drops"] if p["name"] != free["name"])
         swap = _tool("add_player", add=nxt["name"], drop=cut, apply=True)
         assert swap["applied"] is True
-        items = b.client.posts[2]["items"]
+        items = b.client.posts[1]["items"]
         assert [i["type"] for i in items] == ["ADD", "DROP"]
-        assert len(b.team_players(CFG.team_id)) == 17
+        assert len(b.team_players(CFG.team_id)) == 16
 
         gone = _tool("add_player", add=free["name"])
         assert "not on the free-agent pool" in gone["error"]
@@ -1070,3 +1069,32 @@ def test_a_proposal_is_open_only_until_something_answers_it_or_it_expires():
         proposal("not-mine", team=3, partner=4, expirationDate=3_000),
     ]
     assert [t["id"] for t in open_trade_proposals(txs, me, now)] == ["open", "no-expiry"]
+
+
+def test_an_empty_ir_slot_is_not_a_place_for_a_pickup():
+    """The league's roster size counts IR slots; only a player who is out
+    can sit in one."""
+    from types import SimpleNamespace
+
+    from espn_mcp.season import active_limit, over_limit, roster_violations
+
+    shape = SimpleNamespace(roster_size=19, position_limits={},
+                            lineup_slots={0: 1, 2: 2, 4: 2, 6: 1, 16: 1, 17: 1,
+                                          20: 7, 21: 2, 23: 2})
+    assert active_limit(shape) == 17
+    full = [{"player_id": i, "slot_id": 20, "position": "WR"} for i in range(17)]
+    new = {"player_id": 99, "slot_id": None, "position": "RB"}
+    assert over_limit(full, shape) == 0
+    assert over_limit(full + [new], shape, [new]) == 1
+    assert "must drop 1" in roster_violations(full + [new], shape, [new])[0]
+
+    # A man on IR frees a real spot: 18 on the roster, 17 of them active.
+    hurt = {"player_id": 50, "slot_id": 21, "position": "RB"}
+    assert over_limit(full + [hurt], shape) == 0
+    assert over_limit(full[:16] + [hurt, new], shape, [new]) == 0
+    # Someone arriving from another team's IR slot still needs a spot here.
+    theirs = {"player_id": 77, "slot_id": 21, "position": "TE"}
+    assert over_limit(full + [theirs], shape, [theirs]) == 1
+    # No IR slots in the league: the limit is simply the roster size.
+    plain = SimpleNamespace(roster_size=17, position_limits={}, lineup_slots={20: 7})
+    assert active_limit(plain) == 17 and over_limit(full + [new], plain, [new]) == 1

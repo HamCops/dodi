@@ -379,11 +379,34 @@ def position_counts(players: list[dict]) -> dict[str, int]:
     return dict(sorted(out.items()))
 
 
-def roster_violations(players: list[dict], shape: LeagueShape) -> list[str]:
+def active_limit(shape: LeagueShape) -> int:
+    """How many players a roster can hold outside injured reserve.
+
+    ESPN's roster size counts the IR slots, but an IR slot only takes a
+    player who is out. An empty one is not a place to put a pickup.
+    """
+    return shape.roster_size - shape.lineup_slots.get(IR_SLOT_ID, 0)
+
+
+def over_limit(players: list[dict], shape: LeagueShape, incoming: list[dict] = ()) -> int:
+    """How many players must go for the roster to be legal.
+
+    Players sitting in an IR slot do not count. Players arriving do, whatever
+    slot they held where they came from.
+    """
+    arriving = {p["player_id"] for p in incoming}
+    active = sum(1 for p in players
+                 if p["player_id"] in arriving or p.get("slot_id") != IR_SLOT_ID)
+    return max(active - active_limit(shape), 0)
+
+
+def roster_violations(players: list[dict], shape: LeagueShape,
+                      incoming: list[dict] = ()) -> list[str]:
     out = []
-    over = len(players) - shape.roster_size
+    over = over_limit(players, shape, incoming)
     if over > 0:
-        out.append(f"{over} over the roster limit of {shape.roster_size} -- must drop {over}")
+        out.append(f"{over} over the roster limit of {active_limit(shape)} "
+                   f"(not counting IR) -- must drop {over}")
     for pos, n in position_counts(players).items():
         cap = shape.position_limits.get(pos)
         if cap is not None and n > cap:
@@ -475,13 +498,13 @@ def evaluate_swap(roster: list[dict], out_players: list[dict], in_players: list[
     after = [p for p in roster if p["player_id"] not in out_ids] + list(in_players)
     before_s = _side_summary(roster, shape)
     after_s = _side_summary(after, shape)
-    violations = roster_violations(after, shape)
+    violations = roster_violations(after, shape, in_players)
     return {
         "before": before_s,
         "after": after_s,
         "delta": _delta(before_s, after_s),
         "roster_after": after,
-        "must_drop": max(len(after) - shape.roster_size, 0),
+        "must_drop": over_limit(after, shape, in_players),
         "violations": violations,
     }
 
