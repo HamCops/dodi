@@ -102,8 +102,9 @@ sent elsewhere. They expire mid-season; an auth error means re-copy them.
 |---|---|
 | `get_matchup` | Both lineups, start/sit swaps with point values, opponent holes, win probability. `week=N` for lookahead. |
 | `set_lineup` | Preview the optimal swaps; `apply=true` submits them. Locked players (game started) are planned around. |
-| `move_player` | One player → one slot. Swaps out the weakest occupant if the slot is full. |
+| `move_player` | One player → one slot. Swaps out the weakest occupant if the slot is full. Under approvals it refuses a move that lowers this week's projection. |
 | `get_roster` | Any team's full roster with projections and positional strength. |
+| `notify_manager` | A short push saying a report is waiting, so an agent needs no shell to ping. Title 60 chars, message 200, no links. |
 
 ### Waivers and free agents
 
@@ -252,7 +253,14 @@ Dodi runs as four cron jobs in Hermes, each loading the same skill/prompt:
 | Monday 22:00 UTC | MNF late injury check |
 
 Each run delivers a report to Discord and a short push notification to the
-phone via ntfy, so you know to check it without staring at Discord all day.
+phone via ntfy (the `notify_manager` tool), so you know to check it without
+staring at Discord all day.
+
+**Give the agent the MCP server and nothing else.** Team names are written by
+the other managers and reach the prompt; the server strips them to short,
+plain labels, but an agent with a shell could still be talked into reading
+`.env` or the approval queue. In Hermes, set the job's `enabled_toolsets` to
+just this server (e.g. `["espn"]`).
 
 ### 3. Let it write
 
