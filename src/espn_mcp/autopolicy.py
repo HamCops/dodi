@@ -19,6 +19,8 @@ and where it is not:
 
 from __future__ import annotations
 
+from .stash import STASH_MARGIN
+
 STREAM_POSITIONS = ("D/ST", "K")
 
 
@@ -36,13 +38,26 @@ def _add(params: dict, preview: dict) -> tuple[bool, str]:
     week = delta.get("starters_this_week") or 0
     pos = (preview.get("add") or {}).get("pos")
     drops = preview.get("drop") or []
+    stash = preview.get("stash") or {}
     if pos in STREAM_POSITIONS and drops and all(d.get("pos") == pos for d in drops):
         if week > 0:
             return True, f"{pos} swapped for {pos}, better this week."
         return False, f"{pos} swap does not help this week."
     if ros > 0:
         return True, "Raises the lineup rest of season."
-    return False, "Does not raise the lineup rest of season."
+    # Stash: neither player starts, so judge the spot, not the lineup. Never
+    # at the cost of this week's lineup.
+    if week < 0:
+        return False, "Costs points this week."
+    if stash.get("over_position_cap"):
+        return False, f"Would hold too many at {pos}: not upside, a wasted spot."
+    add_score = stash.get("add_stash_score") or 0
+    floor = stash.get("floor") or 0
+    if stash.get("drop_is_dead_spot") and add_score >= floor:
+        return True, "Fills a dead spot (a D/ST or K who cannot start) with upside."
+    if drops and add_score >= (stash.get("drop_stash_score") or 0) + STASH_MARGIN:
+        return True, "More bench upside than the player dropped."
+    return False, "Does not raise the lineup rest of season, and not a clear stash upgrade."
 
 
 def _trade(params: dict, preview: dict) -> tuple[bool, str]:

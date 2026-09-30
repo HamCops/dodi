@@ -264,6 +264,13 @@ def main() -> None:
     from .nudge import run as nudge
     for line in nudge():
         print(time.strftime("%Y-%m-%d %H:%M:%S"), line)
+    # Look for news between scheduled runs; wakes Dodi only on real change.
+    from .watch import run as watch
+    try:
+        for line in watch():
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), line)
+    except Exception as exc:  # noqa: BLE001 - the watcher must never break the tick
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), f"watch failed: {type(exc).__name__}: {exc}")
 
 
 def _alert(error: str) -> None:

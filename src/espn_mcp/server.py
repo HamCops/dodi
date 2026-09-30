@@ -17,6 +17,8 @@ from mcp.server import MCPServer
 from . import __version__
 from .autopolicy import auto_ok
 from .board import DraftBoard
+from .stash import (POSITION_CAP, STASH_FLOOR, dead_spots, replacement_per_game, stash_moves,
+                    stash_score)
 from .constants import SLOT_BY_ID
 from .config import Config, load_config
 from .espn import ESPNError
@@ -1513,6 +1515,34 @@ def _approval_gate(apply: bool) -> dict | None:
 _LAG_NOTE = "ESPN accepted the change but its reads have not caught up yet; re-read in a moment."
 
 
+def _stash_repl(b: DraftBoard, shape: LeagueShape, week: int) -> dict:
+    """Replacement level per position, in points a game, for stash_score."""
+    board_ = b.season_board(week)
+    # ROS totals cover the weeks left, one of which is usually a bye.
+    games_left = max(shape.final_week - shape.current_week, 1)
+    return replacement_per_game(board_["replacement_points"], games_left)
+
+
+def _stash_view(b: DraftBoard, shape: LeagueShape, week: int, me: int,
+                mine: list[dict], target: dict, drops: list[dict]) -> dict:
+    """How an add looks as a stash: his upside, and whether the drop is dead."""
+    repl = _stash_repl(b, shape, week)
+    pending_drop = set((b.league_rosters(week).get(me) or {}).get("pending_drop_ids") or [])
+    dead_ids = {p["player_id"] for p in dead_spots(mine, pending_drop)}
+    pos = target["position"]
+    held = sum(1 for p in mine if p["position"] == pos and p["player_id"] not in pending_drop
+               and p.get("slot_id") != 21)
+    like_for_like = bool(drops) and all(p["position"] == pos for p in drops)
+    return {
+        "add_stash_score": stash_score(target, repl),
+        "drop_stash_score": round(sum(stash_score(p, repl) for p in drops), 2),
+        "drop_is_dead_spot": bool(drops) and all(p["player_id"] in dead_ids for p in drops),
+        "over_position_cap": (pos in POSITION_CAP and not like_for_like
+                              and held + 1 > POSITION_CAP[pos]),
+        "floor": STASH_FLOOR,
+    }
+
+
 @mcp.tool()
 @handle_errors
 def add_player(add: str, drop: str | None = None, apply: bool = False,
@@ -1560,6 +1590,7 @@ def add_player(add: str, drop: str | None = None, apply: bool = False,
         "drop": [_slim_season(p) for p in drops],
         "transaction": "waiver claim" if waiver else "free-agent add",
         **_swap_preview(res, shape, target["position"], incoming=[target]),
+        "stash": _stash_view(b, shape, week, me, mine, target, drops),
     }
     if waiver and target.get("waiver_clears_ms"):
         out["waivers_clear"] = _local_time(target["waiver_clears_ms"], "%a %b %d %I:%M %p")
@@ -1925,6 +1956,24 @@ def get_waiver_targets(position: str | None = None, limit: int = 12,
     if shape.waivers.get("uses_faab"):
         spent = mine_t.get("faab_spent") or 0
         out["faab_remaining"] = (shape.waivers.get("faab_budget") or 0) - spent
+    # Bench upside: dead spots (a D/ST or K who cannot start) and weak bench
+    # players, each paired with the best stash for it. These do not raise
+    # today's lineup, which is why lineup_gain never finds them.
+    repl = _stash_repl(b, shape, week)
+    starters = {p["player_id"] for key in (ROS_KEY, WEEK_KEY)
+                for _, p in optimal_lineup(my, shape, key)["starters"] if p}
+    out["stash_moves"] = stash_moves(
+        my, avail, starters, repl, set(mine_t.get("pending_add_ids") or []),
+        set(mine_t.get("pending_drop_ids") or []), limit=3)
+    out["dead_spots"] = [p["name"] for p in dead_spots(
+        my, set(mine_t.get("pending_drop_ids") or []))]
+    out["stash_note"] = (
+        "stash_moves turn dead or weak roster spots into upside. stash_score is "
+        "points a game above replacement at the position, from workload "
+        "(expected_ppg), ESPN's rest-of-season projection and Sleeper pickup "
+        "trends. dead_spots are D/ST and K beyond the one that starts: they can "
+        "never score for you, so any stash above the floor is better. Queue "
+        "these; players already claimed or dropped by a pending claim are left out.")
     if b.signals is None:
         del out["trending_pickups"]
         del out["workload_targets"]

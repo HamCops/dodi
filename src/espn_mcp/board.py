@@ -550,6 +550,18 @@ class DraftBoard:
                     "player": rec_player,
                 })
             counter = t.get("transactionCounter") or {}
+            # Claims and adds still waiting on the waiver run: the players they
+            # would add and drop. A new move must not drop a man a pending
+            # claim already drops, or claim a man already claimed.
+            pending_add, pending_drop = set(), set()
+            for tx in t.get("pendingTransactions") or []:
+                if tx.get("type") not in ("WAIVER", "FREEAGENT") or tx.get("status") != "PENDING":
+                    continue
+                for item in tx.get("items") or []:
+                    if item.get("type") == "ADD":
+                        pending_add.add(int(item["playerId"]))
+                    elif item.get("type") == "DROP":
+                        pending_drop.add(int(item["playerId"]))
             teams[int(t["id"])] = {
                 "team_id": int(t["id"]),
                 "name": (t.get("name") or f"{t.get('location','')} {t.get('nickname','')}").strip(),
@@ -565,6 +577,8 @@ class DraftBoard:
                 "acquisitions": counter.get("acquisitions"),
                 "trades": counter.get("trades"),
                 "trade_block_ids": [int(pid) for pid, v in block.items() if v == "ON_THE_BLOCK"],
+                "pending_add_ids": sorted(pending_add),
+                "pending_drop_ids": sorted(pending_drop),
                 "entries": entries,
             }
         with self._lock:

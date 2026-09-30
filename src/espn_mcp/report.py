@@ -9,6 +9,7 @@ week, that half of the report says so instead of guessing.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import time
@@ -250,6 +251,17 @@ def facts(b: DraftBoard, now: float | None = None) -> str:
                          + (f" Error: {note[:160]}" if note else ""))
     else:
         lines.append("- Approval queue, last 7 days: empty.")
+    # What the watcher saw since the last run, so a woken agent knows why.
+    try:
+        watch_state = json.loads((b.cfg.state_root / f"watch-{b.cfg.league_id}-"
+                                  f"{b.cfg.season}.json").read_text())
+        news = watch_state.get("last_events") or []
+        if news:
+            lines.append(f"- Watcher news ({when(watch_state.get('last_events_at', now))}):")
+            lines.extend(f"    {e['text']}" + (" [URGENT]" if e.get("urgent") else "")
+                         for e in news)
+    except (OSError, ValueError):
+        pass
     return "\n".join(lines)
 
 
