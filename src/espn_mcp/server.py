@@ -1967,6 +1967,10 @@ def get_waiver_targets(position: str | None = None, limit: int = 12,
         set(mine_t.get("pending_drop_ids") or []), limit=3)
     out["dead_spots"] = [p["name"] for p in dead_spots(
         my, set(mine_t.get("pending_drop_ids") or []))]
+    # First in the output: the full result runs past 60k characters and the
+    # agent only sees the head of it. On 2026-09-30 the watch run could not
+    # read these keys at the end and tried to run code to find them.
+    out = {"stash_moves": out.pop("stash_moves"), "dead_spots": out.pop("dead_spots"), **out}
     out["stash_note"] = (
         "stash_moves turn dead or weak roster spots into upside. stash_score is "
         "points a game above replacement at the position, from workload "
