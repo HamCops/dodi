@@ -90,6 +90,14 @@ class Config:
                 f"state_dir={self.state_dir!r})")
 
 
+def _token_file(path: str) -> str | None:
+    """A secret kept in its own file (mode 600), shared with other publishers."""
+    try:
+        return Path(path).expanduser().read_text().strip() or None
+    except OSError:
+        return None
+
+
 def _flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -121,7 +129,8 @@ def load_config() -> Config:
         remind_after_minutes=int(os.environ.get("REMIND_AFTER_MINUTES", "60")),
         ntfy_url=os.environ.get("NTFY_URL", "").strip() or None,
         ntfy_topic=os.environ.get("NTFY_TOPIC", "").strip() or None,
-        ntfy_token=os.environ.get("NTFY_TOKEN", "").strip() or None,
+        ntfy_token=(os.environ.get("NTFY_TOKEN", "").strip() or _token_file(
+            os.environ.get("NTFY_TOKEN_FILE", "~/.config/ntfy/publish-token")) or None),
         approve_base_url=os.environ.get("APPROVE_BASE_URL", "").strip() or None,
         approve_port=int(os.environ.get("APPROVE_PORT", "6075")),
         external_sources=_flag(os.environ.get("ESPN_EXTERNAL_SOURCES")),

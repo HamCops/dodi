@@ -22,6 +22,24 @@ from .season import attach_ros
 from .sources import Signals, build_signals
 from .value import build_value_board, value_vs_adp
 
+# Team names and abbreviations are written by the other managers, and they
+# reach an LLM's prompt (FACTS, tool results). Treat them as untrusted data:
+# printable characters only, no brackets or quotes that could fake structure,
+# and short enough that no instruction fits. ESPN's own limit is about 30.
+TEAM_NAME_MAX = 32
+_UNSAFE = str.maketrans({c: " " for c in "\"'`<>{}[]\\|"})
+
+
+def clean_label(text: object, limit: int = TEAM_NAME_MAX) -> str:
+    s = "".join(ch for ch in str(text or "") if ch.isprintable())
+    s = " ".join(s.translate(_UNSAFE).split())
+    return s[:limit].rstrip()
+
+
+def team_name(t: dict) -> str:
+    raw = t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}"
+    return clean_label(raw) or f"Team {t.get('id')}"
+
 # ESPN marks an undrafted schedule slot with this player id. Real player ids
 # are positive except D/ST, which are negative -- so -1 must be matched
 # exactly, never treated as "any non-positive id".
@@ -164,8 +182,8 @@ class DraftBoard:
         for t in payload.get("teams") or []:
             teams[int(t["id"])] = {
                 "team_id": int(t["id"]),
-                "name": (t.get("name") or f"{t.get('location','')} {t.get('nickname','')}").strip(),
-                "abbrev": t.get("abbrev"),
+                "name": team_name(t),
+                "abbrev": clean_label(t.get("abbrev"), 6),
                 "roster_player_ids": [
                     int(e["playerId"])
                     for e in ((t.get("roster") or {}).get("entries") or [])
@@ -564,8 +582,8 @@ class DraftBoard:
                         pending_drop.add(int(item["playerId"]))
             teams[int(t["id"])] = {
                 "team_id": int(t["id"]),
-                "name": (t.get("name") or f"{t.get('location','')} {t.get('nickname','')}").strip(),
-                "abbrev": t.get("abbrev"),
+                "name": team_name(t),
+                "abbrev": clean_label(t.get("abbrev"), 6),
                 "wins": rec.get("wins", 0),
                 "losses": rec.get("losses", 0),
                 "ties": rec.get("ties", 0),

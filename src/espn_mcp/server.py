@@ -16,7 +16,7 @@ from mcp.server import MCPServer
 
 from . import __version__
 from .autopolicy import auto_ok
-from .board import DraftBoard
+from .board import DraftBoard, clean_label
 from .stash import (POSITION_CAP, STASH_FLOOR, dead_spots, replacement_per_game, stash_moves,
                     stash_score)
 from .constants import SLOT_BY_ID
@@ -24,7 +24,7 @@ from .config import Config, load_config
 from .espn import ESPNError
 from .factcheck import known_numbers, unsupported_numbers
 from .market import acceptable, trade_view, worth_offering
-from .notify import deadline, push_proposal
+from .notify import deadline, push, push_proposal
 from .proposals import ProposalError, ProposalStore, clean_params, public
 from .scoring import LeagueShape
 from .sources.signals import market_view
@@ -1368,6 +1368,39 @@ def start_player(player: str, over: str, apply: bool = False) -> dict:
     return out
 
 
+def _week_change(players: list[dict], moves: list[dict]) -> float:
+    """This week's projected points gained by starters after `moves`."""
+    def starting(slot_id) -> bool:
+        return slot_id not in (20, 21)
+    by_id = {p["player_id"]: p for p in players}
+    total = 0.0
+    for m in moves:
+        p = by_id.get(m["player_id"]) or {}
+        pts = float(p.get("adj_week_proj") if p.get("adj_week_proj") is not None
+                    else p.get(WEEK_KEY) or 0.0)
+        total += pts * (int(starting(m["to_slot_id"])) - int(starting(m["from_slot_id"])))
+    return round(total, 2)
+
+
+@mcp.tool()
+@handle_errors
+def notify_manager(title: str, message: str) -> dict:
+    """Send the manager a short push to say a report is waiting in Discord.
+
+    The only way a run pings his phone besides the approval pushes. Title up
+    to 60 characters, message up to 200; no links or buttons. Do not use it
+    for a move you queued (that push is sent already) or for a [SILENT] run.
+    """
+    b = board()
+    title = clean_label(title, 60)
+    message = " ".join(str(message or "").split())[:200]
+    if not title or not message:
+        return {"error": "Title and message are both needed."}
+    if not title.lower().startswith("dodi"):
+        title = f"Dodi: {title}"[:60]
+    return push(b.cfg, title, message, priority=3, tags=["football"])
+
+
 @mcp.tool()
 @handle_errors
 def move_player(player: str, to_slot: str, week: int | None = None) -> dict:
@@ -1404,6 +1437,19 @@ def move_player(player: str, to_slot: str, week: int | None = None) -> dict:
     plan = plan_move(players, shape, mover, sid, WEEK_KEY, now_ms=_now_ms())
     if "error" in plan:
         return {"error": plan["error"]}
+    # A single slot move is the one ESPN write that skips request_approval, so
+    # it may not make this week's lineup worse: benching a starter for a
+    # weaker man is the manager's call, through start_player. Guards against a
+    # confused or steered agent, not the manager.
+    if board().cfg.require_approval and not _approved_call.get():
+        change = _week_change(players, plan["moves"])
+        if change < 0:
+            return {"error": "This move lowers this week's projected lineup "
+                             f"({change:+.2f}) and was not sent.",
+                    "applied": False, "recoverable": True,
+                    "hint": "Use set_lineup for the best lineup, or queue the swap with "
+                            "request_approval('start_player', {'player': ..., 'over': ...}, "
+                            "reasoning) if the manager should decide."}
     result = b.client.set_lineup(me, week, plan["moves"])
     synced = _after_write(b, week, _expect_slots(me, plan["moves"]))
     out: dict[str, Any] = {
