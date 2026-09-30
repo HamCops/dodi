@@ -61,7 +61,16 @@ def snapshot(b) -> dict:
         "trending": sorted(p["name"] for p in avail if (p.get("adds_24h") or 0) >= TRENDING_ADDS),
         "stash": sorted(f"{m['add']} for {m['drop']}" for m in moves),
         "trades": sorted(str(t.get("id")) for t in _pending_proposals(b, me)),
+        # Claims waiting on the waiver run, with names, so the next look can
+        # tell won from lost: a won claim's player is then on my roster.
+        "claims": {str(pid): _name(b, week, pid) for pid in team.get("pending_add_ids") or []},
+        "roster_ids": sorted(p["player_id"] for p in mine),
     }
+
+
+def _name(b, week: int, pid: int) -> str:
+    p = (b.season_board(week).get("by_id") or {}).get(int(pid))
+    return p["name"] if p else str(pid)
 
 
 def diff(old: dict, new: dict) -> list[dict]:
@@ -88,7 +97,33 @@ def diff(old: dict, new: dict) -> list[dict]:
         events.append({"kind": "trade", "urgent": False, "text": "New trade offer"})
     for tid in sorted(set(old["trades"]) - set(new["trades"])):
         events.append({"kind": "trade", "urgent": False, "text": "A trade offer was answered"})
+    # A claim that is no longer pending was decided: won if he is now mine.
+    roster = set(new.get("roster_ids") or [])
+    for pid, name in (old.get("claims") or {}).items():
+        if pid in (new.get("claims") or {}):
+            continue
+        won = int(pid) in roster
+        events.append({"kind": "claim", "urgent": False, "won": won,
+                       "text": f"Claim {'won' if won else 'lost'}: {name}"})
     return events
+
+
+def _quiet(now: float, tz: str) -> bool:
+    hour = datetime.fromtimestamp(now, ZoneInfo(tz)).hour
+    return hour >= QUIET[0] or hour < QUIET[1]
+
+
+def _push_claims(cfg, results: list[dict]) -> bool:
+    from .notify import push
+    won = [e["text"].split(": ", 1)[1] for e in results if e.get("won")]
+    lost = [e["text"].split(": ", 1)[1] for e in results if not e.get("won")]
+    body = []
+    if won:
+        body.append("Won: " + ", ".join(won))
+    if lost:
+        body.append("Lost: " + ", ".join(lost))
+    title = f"Dodi: waivers {len(won)} won, {len(lost)} lost"
+    return push(cfg, title, "\n".join(body), tags=["inbox_tray"]).get("sent", False)
 
 
 def should_wake(events: list[dict], state: dict, now: float, tz: str,
@@ -98,9 +133,7 @@ def should_wake(events: list[dict], state: dict, now: float, tz: str,
     urgent = any(e["urgent"] for e in events)
     if agent_due_soon:
         return False                       # the game-time run will see it anyway
-    hour = datetime.fromtimestamp(now, ZoneInfo(tz)).hour
-    quiet = hour >= QUIET[0] or hour < QUIET[1]
-    if quiet and not urgent:
+    if _quiet(now, tz) and not urgent:
         return False
     if not urgent and now - state.get("last_wake", 0) < WAKE_GAP:
         return False
@@ -139,12 +172,28 @@ def run(now: float | None = None, *, board_fn: Callable | None = None,
     if events:
         state["last_events"] = events
         state["last_events_at"] = now
-    if should_wake(events, state, now, b.cfg.timezone, _agent_due_soon(b, now)):
-        if (wake or _wake)(events):
+    # News that could not wake Dodi yet (quiet hours, the 3h gap, a game-time
+    # run about to fire) is held, not dropped. Held news older than a day is
+    # stale: the scheduled runs have seen the roster since.
+    held = [e for e in state.get("held") or [] if now - e.get("at", now) < 86400]
+    held += [{**e, "at": now} for e in events]
+    # Claim results go straight to the phone: no model needed to say won or lost.
+    results = (state.get("unsent_claims") or []) + [e for e in events if e["kind"] == "claim"]
+    if results and not _quiet(now, b.cfg.timezone):
+        if _push_claims(b.cfg, results):
+            lines.append(f"watch: pushed {len(results)} claim result(s)")
+            results = []
+    state["unsent_claims"] = results
+    if should_wake(held, state, now, b.cfg.timezone, _agent_due_soon(b, now)):
+        if (wake or _wake)(held):
             state["last_wake"] = now
-            lines.append(f"watch: woke Dodi ({len(events)} event(s))")
+            state["last_events"] = held
+            state["last_events_at"] = now
+            lines.append(f"watch: woke Dodi ({len(held)} event(s))")
+            held = []
         else:
-            lines.append("watch: wake failed; will report again on the next change")
+            lines.append("watch: wake failed; will try again next tick")
+    state["held"] = held
     state["snapshot"] = new
     state["checked_at"] = now
     path.parent.mkdir(parents=True, exist_ok=True)

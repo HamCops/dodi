@@ -57,3 +57,47 @@ def test_wakes_are_rationed():
     assert should_wake(urgent, {}, at(23, 30), TZ, False)                       # except out
     assert not should_wake(urgent, {}, at(14), TZ, True)       # game-time run is about to
     assert not should_wake([], {}, at(14), TZ, False)
+
+
+def test_a_decided_claim_is_won_or_lost_by_whether_he_is_on_the_roster():
+    old = snap(claims={"4711533": "Ollie Gordon II", "-16009": "Packers D/ST"},
+               roster_ids=[1, 2, 3])
+    new = snap(claims={}, roster_ids=[1, 2, 3, -16009])
+    got = {e["text"]: e["won"] for e in diff(old, new) if e["kind"] == "claim"}
+    assert got == {"Claim lost: Ollie Gordon II": False, "Claim won: Packers D/ST": True}
+    # Still pending: nothing to say yet.
+    assert not [e for e in diff(old, old) if e["kind"] == "claim"]
+
+
+def test_overnight_news_is_held_for_the_morning_not_dropped(tmp_path, monkeypatch):
+    """The 3 AM waiver run: results wait until 8 AM, then one push and one wake."""
+    import dataclasses
+
+    import espn_mcp.watch as w
+    from test_integration import CFG
+
+    cfg = dataclasses.replace(CFG, state_dir=str(tmp_path))
+
+    class B:
+        pass
+    b = B()
+    b.cfg = cfg
+    snaps = iter([
+        snap(claims={"4711533": "Ollie Gordon II"}, roster_ids=[1, 2, 3]),  # evening
+        snap(claims={}, roster_ids=[1, 2, 3]),                              # 3 AM: lost
+        snap(claims={}, roster_ids=[1, 2, 3]),                              # 8 AM
+    ])
+    monkeypatch.setattr(w, "snapshot", lambda b: next(snaps))
+    monkeypatch.setattr(w, "_agent_due_soon", lambda b, now: False)
+    pushed, woke = [], []
+    monkeypatch.setattr(w, "_push_claims", lambda cfg, r: pushed.append(r) or True)
+    wake = lambda ev: woke.append(ev) or True  # noqa: E731
+
+    night = datetime(2026, 9, 29, 20, 0, tzinfo=ET).timestamp()
+    w.run(night, board_fn=lambda: b, wake=wake)
+    lines = w.run(night + 7 * 3600, board_fn=lambda: b, wake=wake)          # 3 AM
+    assert "watch: Claim lost: Ollie Gordon II" in lines
+    assert pushed == [] and woke == []                                     # asleep
+    w.run(night + 12 * 3600, board_fn=lambda: b, wake=wake)                # 8 AM
+    assert len(pushed) == 1 and pushed[0][0]["text"] == "Claim lost: Ollie Gordon II"
+    assert len(woke) == 1 and woke[0][0]["kind"] == "claim"   # Dodi looks for the next man

@@ -322,7 +322,31 @@ def status(now: float | None = None) -> str:
         lines.append(f"  approve by    {fmt(k - EXPIRES_BEFORE * MIN)}")
     if not sched.slots:
         lines.append("No games left this week.")
+    lines.append("")
+    lines.extend(_watch_status(cfg, zone))
     return "\n".join(lines)
+
+
+def _watch_status(cfg, zone) -> list[str]:
+    """What the watcher last saw, for `espn-mcp-tick status`."""
+    fmt = lambda ts: datetime.fromtimestamp(ts, zone).strftime("%a %b %-d %-I:%M %p")  # noqa: E731
+    try:
+        s = json.loads((cfg.state_root / f"watch-{cfg.league_id}-{cfg.season}.json").read_text())
+    except (OSError, ValueError):
+        return ["Watcher: has not run yet."]
+    snap = s.get("snapshot") or {}
+    out = [f"Watcher: last checked {fmt(s['checked_at'])}"
+           + (f", last woke Dodi {fmt(s['last_wake'])}" if s.get("last_wake") else
+              ", has not woken Dodi yet")]
+    claims = snap.get("claims") or {}
+    out.append(f"  pending claims: {', '.join(claims.values()) or 'none'}")
+    out.append(f"  stash moves on offer: {', '.join(snap.get('stash') or []) or 'none'}")
+    if s.get("held"):
+        out.append("  held for later: " + "; ".join(e["text"] for e in s["held"]))
+    if s.get("unsent_claims"):
+        out.append("  claim results waiting for 8 AM: "
+                   + "; ".join(e["text"] for e in s["unsent_claims"]))
+    return out
 
 
 if __name__ == "__main__":
